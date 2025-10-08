@@ -2,74 +2,142 @@
 
 import os
 import requests
+import time
 from tqdm import tqdm
-from transformers import AutoModelForVision2Seq, AutoProcessor
+import json
 
 # --- Configuration ---
 MODELS_DIR = "./models"
-SIGLIP_MODEL_URL = "https://storage.googleapis.com/big_vision/siglip2/siglip2_b16_512.npz"
-SIGLIP_MODEL_FILENAME = "siglip2_b16_512.npz"
-DOTS_MODEL_HF_ID = "rednote-hilab/dots.ocr"
+HF_HUB_URL = "https://huggingface.co"
 
-# --- Helper Function ---
-def download_file(url, destination):
-    """Downloads a file with a progress bar."""
-    try:
-        with requests.get(url, stream=True) as r:
-            r.raise_for_status()
-            total_size = int(r.headers.get('content-length', 0))
-            with open(destination, 'wb') as f, tqdm(
-                desc=destination.split('/')[-1],
-                total=total_size,
-                unit='iB',
-                unit_scale=True,
-                unit_divisor=1024,
-            ) as bar:
-                for chunk in r.iter_content(chunk_size=8192):
-                    size = f.write(chunk)
-                    bar.update(size)
-        print(f"Successfully downloaded {destination}")
-    except Exception as e:
-        print(f"Error downloading {url}: {e}")
+MODELS_TO_DOWNLOAD = {
+    "siglip": {
+        "repo_id": "google/siglip-base-patch16-512",
+        "required_files": ["config.json", "model.safetensors", "preprocessor_config.json",
+         "tokenizer_config.json", "spiece.model",
+          "tokenizer.json", "special_tokens_map.json",]
+    },
+    "dots_ocr": {
+        "repo_id": "rednote-hilab/dots.ocr",
+        "required_files": [
+            "config.json", "model.safetensors", "generation_config.json", "chat_template.json", 
+            "configuration_dots.py", "modeling_dots_vision.py", "modeling_dots_ocr.py",
+            "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json",  "special_tokens_map.json", "vocab.json"
 
-def download_siglip_model():
-    """
-    Downloads the SigLIP model weights from Google's public storage.
-    Note: These are raw weights, not a Hugging Face model. Our worker
-    would need code to load this .npz file into a PyTorch model definition.
-    """
-    print("--- Downloading SigLIP Model ---")
-    siglip_dir = os.path.join(MODELS_DIR, "siglip")
-    os.makedirs(siglip_dir, exist_ok=True)
-    destination = os.path.join(siglip_dir, SIGLIP_MODEL_FILENAME)
+        ]
+    }
+}
 
-    if not os.path.exists(destination):
-        download_file(SIGLIP_MODEL_URL, destination)
-    else:
-        print(f"SigLIP model already exists at {destination}. Skipping.")
+# --- NEW: Robust Downloader with Retries ---
+def download_file_with_retries(url, destination, retries=3, timeout=90, backoff_factor=2):
+    """
+    Downloads a file with a progress bar, handling large files, timeouts, and retries.
+    """
+    for attempt in range(retries):
+        try:
+            print(f"Attempt {attempt + 1}/{retries}...")
+            with requests.get(url, stream=True, timeout=timeout) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length', 0))
+                with open(destination, 'wb') as f, tqdm(
+                    desc=os.path.basename(destination),
+                    total=total_size,
+                    unit='iB',
+                    unit_scale=True,
+                    unit_divisor=1024,
+                ) as bar:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        size = f.write(chunk)
+                        bar.update(size)
+            print(f"  Successfully downloaded {os.path.basename(destination)}")
+            return True # Success
+        except requests.exceptions.RequestException as e:
+            print(f"  Download attempt failed: {e}")
+            if attempt + 1 < retries:
+                wait_time = backoff_factor * (2 ** attempt)
+                print(f"  Waiting {wait_time} seconds before retrying...")
+                time.sleep(wait_time)
+            else:
+                print("  All retry attempts failed.")
+                # Clean up partial file on final failure
+                if os.path.exists(destination):
+                    os.remove(destination)
+                return False
 
-def download_dots_ocr_model():
+def download_hf_model_manually(repo_id, initial_files, destination_dir):
     """
-    Downloads the DOTS OCR model and processor using the Hugging Face Hub.
-    This is the recommended way as it handles the complexity automatically.
+    Manually downloads all required files, handling sharded models by
+    looking for an index file if the main model file is not found.
     """
-    print("\n--- Downloading DOTS.ocr Model ---")
-    dots_dir = os.path.join(MODELS_DIR, "dots_ocr")
-    os.makedirs(dots_dir, exist_ok=True)
+    print(f"\nVerifying model '{repo_id}' in '{destination_dir}'...")
+    os.makedirs(destination_dir, exist_ok=True)
     
-    try:
-        print(f"Downloading model '{DOTS_MODEL_HF_ID}' to cache dir '{dots_dir}'...")
-        # The cache_dir ensures the model is saved within our project structure.
-        AutoModelForVision2Seq.from_pretrained(DOTS_MODEL_HF_ID, cache_dir=dots_dir)
-        AutoProcessor.from_pretrained(DOTS_MODEL_HF_ID, cache_dir=dots_dir)
-        print("Successfully downloaded DOTS.ocr model and processor.")
-    except Exception as e:
-        print(f"Could not download model from Hugging Face Hub: {e}")
-        print("Please ensure you have an internet connection and have logged in via `huggingface-cli login` if necessary.")
+    files_to_download = list(initial_files)
+
+    # --- NEW: Logic to handle sharded models ---
+    if "model.safetensors" in files_to_download:
+        # First, check if the single file actually exists by sending a HEAD request (faster than GET)
+        single_model_url = f"{HF_HUB_URL}/{repo_id}/resolve/main/model.safetensors"
+        try:
+            response = requests.head(single_model_url, timeout=10)
+            if response.status_code == 404:
+                print("'model.safetensors' not found. Checking for sharded model index...")
+                index_filename = "model.safetensors.index.json"
+                index_url = f"{HF_HUB_URL}/{repo_id}/resolve/main/{index_filename}"
+                index_dest_path = os.path.join(destination_dir, index_filename)
+
+                # Download the index file first
+                if not os.path.exists(index_dest_path):
+                    if not download_file_with_retries(index_url, index_dest_path):
+                        raise Exception("Could not download the sharded model index file.")
+                
+                # Parse the index to find the real filenames
+                with open(index_dest_path, 'r') as f:
+                    index_data = json.load(f)
+                
+                shard_filenames = sorted(list(set(index_data["weight_map"].values())))
+                print(f"Found {len(shard_filenames)} shards: {shard_filenames}")
+
+                # Update the list of files to download
+                files_to_download.remove("model.safetensors")
+                files_to_download.append(index_filename)
+                files_to_download.extend(shard_filenames)
+        except requests.exceptions.RequestException as e:
+            print(f"Could not check for single model file: {e}. Assuming sharded model.")
+            # Fallback logic could be added here if needed
+
+    # --- Download loop for all required files ---
+    for filename in files_to_download:
+        destination_path = os.path.join(destination_dir, filename)
+        if os.path.exists(destination_path):
+            print(f"'{filename}' already exists. Skipping.")
+            continue
+        
+        url = f"{HF_HUB_URL}/{repo_id}/resolve/main/{filename}"
+        print(f"Fetching '{filename}'...")
+        if not download_file_with_retries(url, destination_path):
+            print(f"FATAL: Failed to download a required file ('{filename}'). Aborting.")
+            return False
+            
+    print(f"All required files for '{repo_id}' are present locally.")
+    return True
 
 if __name__ == "__main__":
-    print("Starting download of required ML models...")
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    download_siglip_model()
-    download_dots_ocr_model()
-    print("\nModel download process complete.")
+    print("Starting download of required ML models for offline use.")
+    print("This script will fetch models from the public Hugging Face Hub and store them locally.")
+    
+    success = True
+    for model_key, model_info in MODELS_TO_DOWNLOAD.items():
+        destination_directory = os.path.join(MODELS_DIR, model_key)
+        if not download_hf_model_manually(
+            model_info['repo_id'],
+            model_info['required_files'],
+            destination_directory
+        ):
+            success = False
+            break
+            
+    if success:
+        print("\nModel download process complete. The application can now run in a fully offline environment.")
+    else:
+        print("\nModel download process failed. Please check the errors above.")
