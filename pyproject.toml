@@ -1,5 +1,5 @@
 [project]
-name = "realtime_salience_capture"
+name = "realtime_latent_capture"
 version = "0.1.0"
 description = "A real-time capture tool for machine learning that records gameplay based on visual and OCR salience."
 authors = [{ name = "Your Name", email = "your@email.com" }]
@@ -17,25 +17,25 @@ classifiers = [
 dependencies = [
     # Core Libraries
     "numpy",
-
     # Frame & Input Capture
     "mss",
     "pynput",
-
     # Data Handling & Serialization
     "pyarrow",
     "orjson",
     "pandas", # Useful for offline analysis and data manipulation
-
     # Machine Learning & Vision
     "torch",
     "torchvision",
     "torchaudio", # Often a peer dependency of torchvision
     "transformers", # For the DOTS OCR model and processor
     "Pillow", # PIL, for image manipulation
-    
+    "sentencepiece",
     # Optional but highly recommended for performance
     "bitsandbytes", # For model quantization (e.g., 8-bit loading)
+    "protobuf",
+    "pywin32",
+    'accelerate>=0.26.0'
 ]
 
 [project.urls]
