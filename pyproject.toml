@@ -1,0 +1,75 @@
+[project]
+name = "realtime_salience_capture"
+version = "0.1.0"
+description = "A real-time capture tool for machine learning that records gameplay based on visual and OCR salience."
+authors = [{ name = "Your Name", email = "your@email.com" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Video :: Capture",
+]
+
+dependencies = [
+    # Core Libraries
+    "numpy",
+
+    # Frame & Input Capture
+    "mss",
+    "pynput",
+
+    # Data Handling & Serialization
+    "pyarrow",
+    "orjson",
+    "pandas", # Useful for offline analysis and data manipulation
+
+    # Machine Learning & Vision
+    "torch",
+    "torchvision",
+    "torchaudio", # Often a peer dependency of torchvision
+    "transformers", # For the DOTS OCR model and processor
+    "Pillow", # PIL, for image manipulation
+    
+    # Optional but highly recommended for performance
+    "bitsandbytes", # For model quantization (e.g., 8-bit loading)
+]
+
+[project.urls]
+Homepage = "https://github.com/your-repo/realtime-salience-capture"
+Repository = "https://github.com/your-repo/realtime-salience-capture"
+
+[tool.uv]
+# This section can be used for uv-specific configurations if needed.
+
+[project.optional-dependencies]
+cuda = [
+    #"flash-attn==2.7.2.post1; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cublas-cu12==12.4.5.8; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cuda-nvcc-cu12==12.4.131; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cuda-nvrtc-cu12==12.4.127; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cuda-runtime-cu12==12.4.127; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cudnn-cu12==9.1.0.70; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cufft-cu12==11.2.1.3; sys_platform == 'linux' or sys_platform == 'win32'",
+    "triton; sys_platform == 'linux'",
+    "triton @ https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl; sys_platform == 'win32'",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
