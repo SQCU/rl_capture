@@ -26,7 +26,7 @@ RECORDING_WINDOW_NAME = "ToramOnline" # e.g., "Cyberpunk 2077"
 CAPTURE_REGION = None # e.g., {"top": 40, "left": 0, "width": 800, "height": 600}
 OUTPUT_PATH = f"./capture_run_{int(time.time())}"
 BUFFER_SECONDS = 10
-CHUNK_SECONDS = 1.0
+CHUNK_SECONDS = 0.5
 CAPTURE_FPS = 30
 
 class FrameArchiver:

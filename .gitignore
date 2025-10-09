@@ -1,6 +1,6 @@
-./models/**
+models/**
 
-./capture_run_*/**
+capture_run_*/
 
-./.venv/**
-./__pycache__/**
+.venv/**
+__pycache__/**

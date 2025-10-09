@@ -78,9 +78,7 @@ class SigLIPSalienceWorker:
         self.vision_encoder.eval()
 
 
-        self.global_distance_stats = OnlineStats()
-        self.global_chunk_variance_stats = OnlineStats()
-        self.last_frame_latent = None
+        self.distance_stats = OnlineStats()
 
     def get_default_config(self) -> dict:
         return { "z_score_global": 4.5, "z_score_local": 3.0, "z_score_chunk": 2.5 }
@@ -90,39 +88,26 @@ class SigLIPSalienceWorker:
         if not frames_chunk: return []
 
         inputs = self.processor(images=frames_chunk, return_tensors="pt", padding=True)
-        pixel_values = inputs["pixel_values"].to(self.device, dtype=self.model.dtype if self.device.type == 'cuda' else torch.float32)
+        pixel_values = inputs["pixel_values"].to(self.device, dtype=self.model.dtype)
         
-        # Get the final pooled output for the entire image
+        # Get the final pooled output, which is the global image representation.
         latents = self.vision_encoder(pixel_values).pooler_output
+        # Compare all adjacent frames in a single GPU operation.
+        distances = (1 - F.cosine_similarity(latents[:-1], latents[1:], dim=1)).cpu().numpy()
 
-        if self.last_frame_latent is not None:
-            all_latents = torch.cat([self.last_frame_latent.unsqueeze(0), latents], dim=0)
-        else:
-            all_latents = latents
-
-        distances = (1 - F.cosine_similarity(all_latents[:-1], all_latents[1:], dim=1)).cpu().numpy()
-
-        local_mean, local_variance = (np.mean(distances), np.var(distances)) if len(distances) > 1 else (distances[0] if len(distances) > 0 else 0, 0)
-        self.global_chunk_variance_stats.update(local_variance)
-        
-        detected_events, is_volatile_chunk = [], local_variance > (self.global_chunk_variance_stats.mean +
-                                              (self.global_chunk_variance_stats.std_dev * self.config['z_score_chunk']))
-
+        detected_events = []
         for i, distance in enumerate(distances):
-            global_mean, global_std = self.global_distance_stats.mean, self.global_distance_stats.std_dev
+            mean, std_dev = self.distance_stats.mean, self.distance_stats.std_dev
+            # Use a simple, robust Z-score to detect a statistically significant spike.
+            is_spike = std_dev > 0 and (distance > mean + (std_dev * self.config['z_score_threshold']))
             
-            is_global_spike = global_std > 0 and (distance > global_mean + (global_std * self.config['z_score_global']))
-            is_local_spike = local_variance > 0 and (distance > local_mean + (np.sqrt(local_variance) * self.config['z_score_local']))
-
-            if is_global_spike or (is_local_spike and is_volatile_chunk):
+            if is_spike:
                 detected_events.append({
-                    "type": "VISUAL_KEYFRAME", "timestamp": timestamps_chunk[i], "reason": "siglip_latent_spike",
-                    "value": float(distance), "details": { "is_global_spike": is_global_spike, "is_local_spike": is_local_spike }
+                    "type": "VISUAL_KEYFRAME", "timestamp": timestamps_chunk[i+1],
+                    "reason": "siglip_latent_spike", "value": float(distance)
                 })
             
-            self.global_distance_stats.update(distance)
-
-        self.last_frame_latent = latents[-1].clone()
+            self.distance_stats.update(distance)
         return detected_events
 
 class OCRLatentWorker:
@@ -158,46 +143,39 @@ class OCRLatentWorker:
         os.makedirs(self.output_path, exist_ok=True)
 
         self.distance_stats = OnlineStats()
-        self.last_latent_hash = None
 
     @torch.no_grad()
     def process_chunk(self, frames_chunk: list[Image.Image], timestamps_chunk: list[float]) -> list:
         if not frames_chunk: return []
         
-        events = []
-        
-        # --- FIX #3: The processor provides all necessary inputs ---
         inputs = self.processor(images=frames_chunk, return_tensors="pt")
-        # Move all tensor inputs to the correct device
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        pixel_values = inputs['pixel_values'].to(self.device, dtype=self.model.dtype)
+        grid_thw = inputs['image_grid_thw'].to(self.device)
 
-        # Call the vision_tower with the arguments it expects
-        # The output is the vision embeddings directly.
-        latents_batch = self.encoder(
-            inputs['pixel_values'],
-            grid_thw=inputs['image_grid_thw']
-        )
-        # Aggregate to a single vector per frame for comparison
-        aggregated_latents = latents_batch.mean(dim=1)
+        # Get the full, spatially-aware feature maps. Shape is e.g., [N, num_patches, Dims]
+        latents_batch = self.encoder(pixel_values, grid_thw=grid_thw)
+        
+        # --- LOGICALLY CORRECT & EFFICIENT CALCULATION ---
+        # Flatten the spatial/patch dimensions to get a single vector per frame [N, P*D]
+        # This preserves ALL spatial information for comparison. No more .mean()!
+        flat_latents = latents_batch.flatten(start_dim=1)
 
-        for i, current_latent in enumerate(aggregated_latents):
-            if self.last_latent_hash is None:
-                self.last_latent_hash = current_latent.clone()
-                events.append(self._create_latent_event(current_latent, timestamps_chunk[i]))
-                continue
-
-            distance = torch.linalg.norm(self.last_latent_hash - current_latent).item()
-            self.distance_stats.update(distance)
-            
+        # Compare all adjacent frames in a single GPU operation.
+        distances = (1 - F.cosine_similarity(flat_latents[:-1], flat_latents[1:], dim=1)).cpu().numpy()
+        
+        detected_events = []
+        for i, distance in enumerate(distances):
             mean, std_dev = self.distance_stats.mean, self.distance_stats.std_dev
-            is_significant_change = std_dev > 0 and (distance > mean + (std_dev * self.config['change_threshold_z_score']))
+            is_significant_change = std_dev > 0 and (distance > mean + (std_dev * self.config['z_score_threshold']))
             
             if is_significant_change:
-                events.append(self._create_latent_event(current_latent, timestamps_chunk[i]))
-                self.last_latent_hash = current_latent.clone()
-        
-        return events
+                # Save the full, un-flattened, un-aggregated latent for this keyframe
+                original_latent_to_save = latents_batch[i] if self.last_latent is None else latents_batch[i-1]
+                events = self._create_latent_event(original_latent_to_save, timestamps_chunk[i])
+                detected_events.append(events)
 
+            self.distance_stats.update(distance)
+        return detected_events
 
     def _create_latent_event(self, latent_tensor: torch.Tensor, timestamp: float) -> dict:
         latent_filename = f"ocr_latent_{timestamp:.4f}.pt"
@@ -249,7 +227,7 @@ def analysis_worker_loop(task_queue, return_queue, worker_class_name, config, ou
             # This prevents the massive memory spike from high-resolution images.
             # We apply this to ALL vision workers by putting it in the generic loop.
             # Using 384*384 for SigLIP base, a common resolution. 512*512 is also fine.
-            downscaled_images = [_downscale_image(img, target_pixel_area=384*384) for img in frames_as_images]
+            downscaled_images = [_downscale_image(img, target_pixel_area=224*224) for img in frames_as_images]
             # --- END FIX ---
             
             # Process the chunk and get the results
