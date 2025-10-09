@@ -328,7 +328,10 @@ def analysis_worker_loop(task_queue, return_queue, worker_class_name, config, ou
             
             if result_data:
                 return_message = {
-                    "chunk_id": task['chunk_id'],
+                    "shm_name": task['shm_name'],     # Pass this through
+                    "shape": task['shape'],           # Pass this through
+                    "dtype": task['dtype'],           # Pass this through
+                    "timestamps": task['timestamps'], # Pass this through
                     "source": worker_class_name,
                     "data": result_data
                 }

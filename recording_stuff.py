@@ -3,6 +3,7 @@
 import mss
 import pynput
 import torch
+import torch.nn.functional as F
 import pyarrow as pa
 import pyarrow.parquet as pq
 import orjson
@@ -12,23 +13,27 @@ import os
 import io
 import numpy as np
 import subprocess
-import queue # For the queue.Empty exception
-from multiprocessing import Process, Queue, shared_memory, Event # --- MODIFIED ---
+import queue 
+from multiprocessing import Process, Queue, shared_memory, Event
 from threading import Thread, Lock
 from PIL import Image
+from collections import deque
 
-from salience_workers import analysis_worker_loop, SigLIPSalienceWorker, OCRLatentWorker
+# We now need one of the salience workers in the Triage process itself
+from salience_workers import analysis_worker_loop, SigLIPSalienceWorker, _downscale_image 
 from window_utils import get_window_finder, WindowNotFoundError
 
 # --- Configuration ---
-# Find a window by title (leave None to capture primary monitor)
-RECORDING_WINDOW_NAME = "ToramOnline" # e.g., "Cyberpunk 2077"
-# Or define a specific region if window title matching fails
-CAPTURE_REGION = None # e.g., {"top": 40, "left": 0, "width": 800, "height": 600}
+RECORDING_WINDOW_NAME = "ToramOnline"
+CAPTURE_REGION = None
 OUTPUT_PATH = f"./capture_run_{int(time.time())}"
-BUFFER_SECONDS = 10
-CHUNK_SECONDS = 0.5
+CHUNK_SECONDS = 10  # How many seconds of frames to triage at a time
 CAPTURE_FPS = 30
+# --- NEW: Triage Configuration ---
+TRIAGE_THRESHOLD = 0.1 # A starting point for max_delta to trigger deep analysis
+
+### helper functions 
+
 
 class FrameArchiver:
     """Handles the saving of individual frames as high-quality images."""
@@ -56,7 +61,6 @@ class FrameArchiver:
             print(f"Error saving frame at timestamp {timestamp}: {e}")
             return None
 
-# --- UNSTUBBED: Input Logging Worker ---
 def input_capture_worker(event_queue: Queue):
     """Listens for keyboard and mouse events and puts them on the event queue."""
     key_states = {} # Tracks the start time of key presses
@@ -99,7 +103,6 @@ def video_encoding_worker_loop(task_queue, result_queue, output_path):
         frames = task['frames']
         timestamps = task['timestamps']
         quality = task['quality']
-        locked_indices = task['locked_indices']
 
         # This call now happens inside the isolated worker process
         proc = video_encoder.start_encode_slice(frames, timestamps, quality)
@@ -110,580 +113,287 @@ def video_encoding_worker_loop(task_queue, result_queue, output_path):
             print(f"[{os.getpid()}] Encoding job finished with code {return_code}.")
 
         # Signal completion back to the main loop
-        result_queue.put({'locked_indices': locked_indices})
+        result_queue.put({'status': 'complete'}) # CHANGED
 
     print(f"[{os.getpid()}] Encoding worker finished.")
 
-class MemoryAndDispatchManager:
+# =====================================================================================
+#  NEW: DEDICATED PROCESS LOOPS
+# =====================================================================================
+
+def capture_process_loop(raw_frame_queue: Queue, config: dict, shutdown_event: Event):
+    """
+    The Collector: The fastest, dumbest part of the pipeline.
+    Its only job is to grab frames and put them on a queue. It cannot be blocked.
+    """
+    print(f"[{os.getpid()}] Capture process started.")
+    window_finder = get_window_finder()
+    
+    with mss.mss() as sct:
+        while not shutdown_event.is_set():
+            start_time = time.time()
+            
+            # Find the window to capture
+            monitor = window_finder.find_window_by_title(config['window_name'])
+            if monitor is None:
+                time.sleep(0.5)
+                continue
+
+            img = sct.grab(monitor)
+            frame_rgb = np.array(img)[:,:,:3]
+
+            try:
+                # Put the raw frame and timestamp on the queue
+                raw_frame_queue.put_nowait((start_time, frame_rgb))
+            except queue.Full:
+                # This is our safety valve. If the downstream Triage is falling behind,
+                # we drop frames here to protect the capture process.
+                print(f"[{os.getpid()}] WARNING: Raw frame queue is full. Triage is not keeping up. Dropping frame.")
+
+            # Sleep to maintain target FPS
+            elapsed = time.time() - start_time
+            sleep_time = (1.0 / config['capture_fps']) - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                
+    print(f"[{os.getpid()}] Capture process finished.")
+
+
+def triage_dispatcher_loop(raw_frame_queue: Queue, salience_task_queue: Queue, config: dict, shutdown_event: Event):
+    """
+    The Brain: Performs cheap, coarse-grained analysis to decide if a chunk of time
+    is "boring" or "interesting" enough to be promoted for deep analysis.
+    """
+    print(f"[{os.getpid()}] Triage Dispatcher started.")
+    
+    # This process needs its own lightweight model for the triage step
+    # We use SigLIP as it's generally faster.
+    triage_worker = SigLIPSalienceWorker(config=None, output_path=config['output_path'])
+    
+    frames_per_chunk = int(config['chunk_seconds'] * config['capture_fps'])
+    frame_buffer = deque(maxlen=frames_per_chunk)
+
+    while not shutdown_event.is_set():
+        try:
+            # Block for a short time to avoid busy-waiting, but remain responsive
+            timestamp, frame = raw_frame_queue.get(timeout=0.1)
+            frame_buffer.append((timestamp, frame))
+
+            if len(frame_buffer) == frames_per_chunk:
+                print(f"[{os.getpid()}] Triage: Analyzing {len(frame_buffer)}-frame chunk...")
+                
+                # --- The Flops-Optimistic Pre-Analysis ---
+                timestamps, frames = zip(*frame_buffer)
+                sentinel_indices = np.linspace(0, len(frames) - 1, 8, dtype=int)
+                sentinel_frames = [_downscale_image(Image.fromarray(frames[i])) for i in sentinel_indices]
+                
+                with torch.no_grad():
+                    latents = triage_worker._inference(sentinel_frames)
+                    distances = (1 - F.cosine_similarity(latents[:-1], latents[1:], dim=1)).cpu().float().numpy()
+                
+                max_delta = np.max(distances) if len(distances) > 0 else 0
+                
+                # --- The Triage Decision ---
+                if max_delta >= config['triage_threshold']:
+                    print(f"[{os.getpid()}] Triage: INTERESTING chunk found (max_delta={max_delta:.4f}). Staging for deep analysis.")
+                    
+                    # 1. Create a new, dedicated Shared Memory block
+                    buffer_shape = (len(frames), *frames[0].shape)
+                    buffer_size = int(np.prod(buffer_shape) * np.dtype(np.uint8).itemsize)
+                    shm_name = f"salience_chunk_{uuid.uuid4()}"
+                    shm = shared_memory.SharedMemory(name=shm_name, create=True, size=buffer_size)
+                    
+                    # 2. Copy the frame data into the new SHM block
+                    shm_buffer = np.ndarray(buffer_shape, dtype=np.uint8, buffer=shm.buf)
+                    np.copyto(shm_buffer, np.array(frames))
+
+                    # 3. Dispatch the task to the salience workers
+                    task = {
+                        "shm_name": shm_name,
+                        "shape": buffer_shape,
+                        "dtype": np.uint8,
+                        "timestamps": list(timestamps)
+                    }
+                    salience_task_queue.put(task)
+                    
+                    shm.close() # Close our handle, the workers will manage its lifetime
+                else:
+                    print(f"[{os.getpid()}] Triage: Boring chunk (max_delta={max_delta:.4f}). Discarding.")
+                
+                # We processed a full chunk, clear the buffer to start fresh
+                frame_buffer.clear()
+
+        except queue.Empty:
+            continue # This is normal, just loop again
+
+    print(f"[{os.getpid()}] Triage Dispatcher finished.")
+
+class Orchestrator:
+    """
+    The Conductor: Manages the lifecycle of all processes and orchestrates the
+    high-level flow of information, but does NOT handle raw frame data directly.
+    """
     def __init__(self, config):
         self.config = config
         self.is_running = True
-        self.is_resizing = False
-
-        # --- One-Time Setup ---
-        self.task_queues = {"ocr": Queue(), "visual": Queue()}
-        self.return_queue = Queue()
-        # This queue is now shared with the persistence manager
-        self.event_persistence_queue = Queue() 
-        self.encoding_task_queue = Queue()
-        self.encoding_results_queue = Queue() # To get completion signals
-        self.num_encoding_workers = 2 # A sensible default
-
-        self.pipeline_lock = Lock()
-        self.window_finder = get_window_finder()
-        # --- NEW: Shared event for graceful shutdown ---
         self.shutdown_event = Event()
-        
-        # --- NEW: Instantiate the Persistence Manager ---
-        parquet_path = os.path.join(self.config['output_path'], "events.parquet")
-        self.persistence_manager = AsyncPersistenceManager(self.config['output_path'], self.event_persistence_queue)
+        self.num_salience_workers = 2
+        self.num_encoding_workers = 2
 
-        initial_geometry = self.window_finder.find_window_by_title(self.config['window_name'])
-        if initial_geometry is None:
-            raise WindowNotFoundError(f"Could not find window '{self.config['window_name']}' on startup.")
+        # --- NEW: A set of specialized queues for a decoupled system ---
+        self.raw_frame_queue = Queue(maxsize=config['capture_fps'] * 3) # Buffer 3s of raw frames
+        self.salience_task_queue = Queue()
+        self.salience_results_queue = Queue()
+        self.encoding_task_queue = Queue()
+        self.encoding_results_queue = Queue()
         
-        self.video_encoder = VideoEncoder(self.config['output_path'])
-        self.frame_archiver = FrameArchiver(self.config['output_path'])
-        self._initialize_capture_pipeline(initial_geometry)
+        # --- State for managing temporary shared memory blocks ---
+        self.active_shm_blocks = {} # {shm_name: shm_instance}
+        
+        # High-level components
+        self.persistence_manager = AsyncPersistenceManager(config['output_path'], Queue()) # Give it its own queue
+        self.frame_archiver = FrameArchiver(config['output_path'])
+        self.video_encoder = VideoEncoder(config['output_path'])
         
         self.processes = []
         self.threads = []
 
-        # --- NEW: State for Time-Based Baseline Recorder ---
-        self.baseline_encoder_pipe = None
-        # This now stores the timestamp of the last saved frame.
-        self.last_baseline_frame_ts = 0.0
-        # The interval in seconds between baseline frames.
-        self.baseline_interval_sec = 5.0 
-
-        
-    def _initialize_capture_pipeline(self, geometry):
-        """Initializes all components that depend on capture dimensions."""
-        print(f"Initializing capture pipeline for geometry: {geometry}")
-        self.capture_monitor = geometry
-        h, w = self.capture_monitor['height'], self.capture_monitor['width']
-        if h <= 0 or w <= 0: raise ValueError("Invalid window geometry")
-        self.capture_dims = (h, w, 3)
-
-        # This queue is for the producer(capture) -> consumer(dispatch) pattern
-        # and should be reset with the pipeline.
-        self._internal_chunk_queue = Queue()
-
-        # Shared Memory Buffer Setup
-        buffer_frames = int(self.config['buffer_seconds'] * self.config['capture_fps'])
-        self.buffer_shape = (buffer_frames, *self.capture_dims)
-        # Calculate the size and explicitly cast it to a standard Python int.
-        buffer_size = int(np.prod(self.buffer_shape) * np.dtype(np.uint8).itemsize)
-        
-        # A unique name is critical for each new shared memory block
-        shm_name = f"salience_capture_{uuid.uuid4()}"
-        self.shm = shared_memory.SharedMemory(name=shm_name, create=True, size=buffer_size)
-        self.buffer = np.ndarray(self.buffer_shape, dtype=np.uint8, buffer=self.shm.buf)
-        self.timestamps = np.zeros(buffer_frames, dtype=np.float64)
-        
-        # Reset state variables for the new pipeline
-        self.write_head = 0
-        self.chunk_size = int(self.config['chunk_seconds'] * self.config['capture_fps'])
-        self.ref_counts = {}
-        self.dispatch_times = {}
-        self.results = {}
-        self.next_chunk_id = 0
-
-        # --- NEW: State for Buffer Management ---
-        # This array tracks which frames are "checked out" by an encoder.
-        self.frame_ref_counts = np.zeros(buffer_frames, dtype=np.int32)
-        # This dict tracks running ffmpeg jobs. {job_id: (future, locked_indices)}
-        self.pending_encodes = {}
-        self.next_encode_job_id = 0
-
-    def _teardown_capture_pipeline(self):
-        """Gracefully shuts down workers and releases shared memory."""
-        print("Tearing down capture pipeline...")
-        self.shutdown_event.set()
-        # Signal workers to stop by putting None on their queues
-                # Signal workers to stop by putting None on their queues (as a fallback)
-        for q in self.task_queues.values():
-            q.put(None)
-        
-        # Wait for worker processes to finish
-        for p in self.processes:
-            p.join(timeout=5) # Give them 5 seconds to finish up
-            if p.is_alive():
-                print(f"Worker {p.pid} did not exit gracefully, terminating.")
-                p.terminate() # Forcefully terminate if they're still stuck
-        self.processes = []
-
-        # Release the shared memory block
-        self.shm.close()
-        self.shm.unlink()
-        print("Pipeline torn down.")
-
-    # --- FIXED: Correct Logic and Daemon Threads ---
-    def run(self):
+    def start(self):
+        """Starts all worker processes and the main orchestration loop."""
         self.start_workers()
         self.persistence_manager.start()
-        self._start_baseline_recorder()
-
-        capture_t = Thread(target=self._capture_loop)
         
-        # Start Input Thread as a Daemon
-        input_t = Thread(target=input_capture_worker, args=(self.event_persistence_queue,))
-        input_t.daemon = True
-        
-        self.threads = [capture_t, input_t]
-        for t in self.threads:
-            t.start()
-
-        print("Starting main dispatch loop... Press Ctrl+C to stop.")
-        while self.is_running:
-            try:
-                if self.is_resizing:
-                    self._handle_resize_event()
-                    continue
-
-                if not self._internal_chunk_queue.empty():
-                    chunk_info = self._internal_chunk_queue.get_nowait()
-                    self.dispatch_chunk(**chunk_info)
-
-                if not self.return_queue.empty():
-                    result = self.return_queue.get_nowait()
-                    chunk_id = result.get('chunk_id')
-                    if chunk_id in self.ref_counts:
-                        if chunk_id not in self.results: self.results[chunk_id] = []
-                        self.results[chunk_id].append(result)
-                        self.ref_counts[chunk_id] -= 1
-                # --- NEW: Section for Monitoring Pending Encodes ---
-                # --- MODIFIED: Replace _check_pending_encodes with this ---
-                while not self.encoding_results_queue.empty():
-                    result = self.encoding_results_queue.get_nowait()
-                    locked_indices = result['locked_indices']
-                    with self.pipeline_lock:
-                        self.frame_ref_counts[locked_indices] -= 1
-                    print(f"Released frame locks for a completed encode.")
-
-                for chunk_id in list(self.ref_counts.keys()):
-                    is_timed_out = (time.time() - self.dispatch_times.get(chunk_id, time.time())) > 10.0
-                    if self.ref_counts.get(chunk_id, -1) <= 0 or is_timed_out:
-                        self.finalize_chunk(chunk_id)
-                
-                # REMOVED: Redundant input event polling. The persistence manager handles this now.
-
-                time.sleep(0.01)
-
-            except (KeyboardInterrupt, SystemExit):
-                self.is_running = False
-                break
-            except Exception: # Catch Empty exceptions from get_nowait
-                continue
-        
-        print("Main loop finished.")
-
-    def _check_pending_encodes(self):
-        """Polls running ffmpeg processes and releases frame locks upon completion."""
-        completed_jobs = []
-        for job_id, (future, locked_indices) in self.pending_encodes.items():
-            # poll() is non-blocking and returns the process exit code, or None if still running.
-            if future.poll() is not None:
-                print(f"Encoding job {job_id} completed with code {future.returncode}.")
-                # Release the frame locks
-                with self.pipeline_lock: # Protect ref counts from race conditions
-                    self.frame_ref_counts[locked_indices] -= 1
-                completed_jobs.append(job_id)
-        
-        # Clean up completed jobs from the dictionary
-        for job_id in completed_jobs:
-            del self.pending_encodes[job_id]
-
-    def _handle_resize_event(self):
-        """The core logic for the "hot swap"."""
-        with self.pipeline_lock:
-            if not self.is_resizing: return # Another thread might have handled it
-            
-            print("Resize detected! Pausing and re-initializing...")
-            
-            # 1. Teardown
-            self._teardown_capture_pipeline()
-
-            # 2. Re-initialize
-            new_geometry = self.window_finder.find_window_by_title(self.config['window_name'])
-            if new_geometry is None:
-                print("Window lost during resize. Shutting down.")
-                self.is_running = False
-                self.is_resizing = False
-                return
-            
-            self._initialize_capture_pipeline(new_geometry)
-
-            # 3. Relaunch workers
-            self.start_workers()
-
-            # 4. Resume
-            self.is_resizing = False
-            print("Pipeline re-initialized. Resuming capture.")
-
-    def _capture_loop(self):
-        frames_since_last_chunk = 0
-        with mss.mss() as sct:
-            while self.is_running:
-                # Pause capture if a resize is in progress
-                if self.is_resizing:
-                    time.sleep(0.1)
-                    continue
-                
-                # --- NEW: CRITICAL Buffer Full Check ---
-                # Check if the next write position is locked by a pending encode.
-                if self.frame_ref_counts[self.write_head] > 0:
-                    print(f"WARNING: Buffer full! Dropping frame. Encoder is not keeping up.")
-                    # Sleep briefly to avoid a tight spinning loop that burns CPU
-                    time.sleep(1.0 / self.config['capture_fps'])
-                    continue # Skip this capture iteration
-
-                start_time = time.time()
-                current_geometry = None
-                if self.config['window_name']:
-                    current_geometry = self.window_finder.find_window_by_title(self.config['window_name'])
-                
-                if current_geometry is None:
-                    # Window lost, pause and retry
-                    print(f"Window '{self.config['window_name']}' lost. Pausing capture...")
-                    time.sleep(1.0)
-                    continue
-
-                # --- UNSTUBBED: Resize Detection Logic ---
-                if (current_geometry['width'] != self.capture_dims[1] or
-                    current_geometry['height'] != self.capture_dims[0]):
-                    # CRITICAL: Signal the resize and stop capturing
-                    self.is_resizing = True
-                    continue # Immediately stop this loop's iteration
-
-                self.capture_monitor = current_geometry
-                img = sct.grab(self.capture_monitor)
-                # Convert BGRA from mss to RGB for our models
-                frame_rgb = np.array(img)[:,:,:3]
-
-                # Write to circular buffer
-                current_head = self.write_head
-                self.buffer[current_head] = frame_rgb
-                self.timestamps[current_head] = start_time
-                self.write_head = (self.write_head + 1) % self.buffer_shape[0]
-                
-                frames_since_last_chunk += 1
-                if frames_since_last_chunk >= self.chunk_size:
-                    if not self.is_running:
-                            break # Exit the loop immediately
-                    chunk_start_index = (self.write_head - self.chunk_size) % self.buffer_shape[0]
-                    self._internal_chunk_queue.put({
-                        "chunk_id": f"chunk_{self.next_chunk_id}",
-                        "start_index": chunk_start_index,
-                        "num_frames": self.chunk_size
-                    })
-                    self.next_chunk_id += 1
-                    frames_since_last_chunk = 0
-                
-                # --- CORRECTED: Time-Based Trigger for Baseline Recorder ---
-                if self.baseline_encoder_pipe and (start_time - self.last_baseline_frame_ts >= self.baseline_interval_sec):
-                    try:
-                        self.baseline_encoder_pipe.write(frame_rgb.tobytes())
-                        # IMPORTANT: Update the timestamp of the last successful write.
-                        self.last_baseline_frame_ts = start_time
-                    except (IOError, BrokenPipeError):
-                        print("Error: Baseline recorder pipe has broken. Attempting to restart...")
-                        self._restart_baseline_recorder()
-                    except Exception as e:
-                        if self.is_running:
-                            print(f"Error in capture loop: {e}")
-                            time.sleep(0.5)
-                        else:
-                            print(f"Error,  breaking: {e}")
-                            break # Exit if shutdown was initiated
-                
-
-                # Sleep to maintain target FPS
-                elapsed = time.time() - start_time
-                sleep_time = (1.0 / self.config['capture_fps']) - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
-    def dispatch_chunk(self, chunk_id, start_index, num_frames):
-        # Get timestamps for the chunk, handling wraparound
-        indices = np.arange(start_index, start_index + num_frames) % self.buffer_shape[0]
-        chunk_timestamps = self.timestamps[indices].tolist()
-
-        task = {
-            "chunk_id": chunk_id, "start": start_index, "num": num_frames,
-            "shm_name": self.shm.name, "shape": self.buffer_shape, "dtype": self.buffer.dtype,
-            "timestamps": chunk_timestamps
-        }
-        
-        num_workers = 0
-        for queue in self.task_queues.values():
-            queue.put(task)
-            num_workers += 1
-        
-        self.ref_counts[chunk_id] = num_workers
-        self.dispatch_times[chunk_id] = time.time()
-        print(f"Dispatched {chunk_id} to {num_workers} workers.")
-
-    # In class MemoryAndDispatchManager:
-
-    def finalize_chunk(self, chunk_id):
-        """
-        Processes all analysis results for a completed chunk, orchestrating
-        video encoding, still image archiving, and metadata logging.
-        """
-        collected_results = self.results.pop(chunk_id, [])
-        if not collected_results:
-            # If there are no results, there's nothing to do.
-            del self.ref_counts[chunk_id]
-            del self.dispatch_times[chunk_id]
-            return
-
-        print(f"Finalizing chunk {chunk_id} with results from {len(collected_results)} worker(s)...")
-
-        # --- Step 1: Initialize Action Plans ---
-        # We will scan all results once and decide what actions to take.
-        video_encode_jobs = []
-        still_archive_jobs = []
-        events_to_log = []
-
-        # --- Step 2: Rule Application Loop ---
-        # Scan all results and populate the action plans.
-        for result_group in collected_results:
-            source_worker = result_group.get('source', 'unknown_worker')
-            for event in result_group.get('data', []):
-                event_type = event.get('type')
-                timestamp = event.get('timestamp')
-
-                if not timestamp:
-                    continue # Skip malformed events
-
-                # Rule A: Visual keyframe triggers a high-quality video encode job.
-                if event_type == 'VISUAL_KEYFRAME':
-                    start_time = timestamp - 2.0
-                    end_time = timestamp + 2.0
-                    video_encode_jobs.append({'start_time': start_time, 'end_time': end_time, 'quality': 'HIGH'})
-                    print(f"  - Plan: Encode HIGH quality video around {timestamp:.2f}s due to {source_worker}.")
-
-                # Rule B: OCR keyframe triggers a still image archive job.
-                if event_type == 'OCR_LATENT_KEYFRAME':
-                    still_archive_jobs.append({'timestamp': timestamp, 'event_type': 'ocr_keyframe', 'original_event': event})
-                    print(f"  - Plan: Archive still image at {timestamp:.2f}s due to {source_worker}.")
-                
-                # All valid events are candidates for logging.
-                events_to_log.append(event)
-        
-        # --- Step 3: Execute Action Plans ---
-
-        # Execute Still Image Archiving (Synchronous, Fast)
-        for job in still_archive_jobs:
-            with self.pipeline_lock: # Lock to safely read from the buffer
-                time_deltas = np.abs(self.timestamps - job['timestamp'])
-                closest_index = np.argmin(time_deltas)
-                
-                if time_deltas[closest_index] < 0.1: # 100ms tolerance
-                    frame_to_save = self.buffer[closest_index]
-                    image_path = self.frame_archiver.save_frame(frame_to_save, job['timestamp'], job['event_type'])
-                    
-                    # IMPORTANT: Mutate the original event to include the image path
-                    if image_path:
-                        job['original_event']['payload']['image_pointer'] = image_path
-                else:
-                    print(f"  - Warning: Could not find a matching frame for still at {job['timestamp']:.2f}s.")
-
-        # Execute Video Encoding (Asynchronous, Slow)
-        # Note: We might have multiple overlapping jobs; a more advanced implementation could merge them.
-        # For now, we process them as they came.
-        # --- MODIFIED: Offload the encode job instead of running it ---
-        for job in video_encode_jobs:
-            with self.pipeline_lock:
-                # This logic was missing. It calculates which frames fall within the job's time range.
-                valid_indices_mask = (self.timestamps >= job['start_time']) & (self.timestamps <= job['end_time'])
-                locked_indices = np.where(valid_indices_mask)[0]
-                if len(locked_indices) > 0:
-                    # Sort indices chronologically to ensure video frames are in the correct order
-                    sorted_indices = sorted(locked_indices, key=lambda i: self.timestamps[i])
-                    frames_to_encode = self.buffer[sorted_indices]
-                    timestamps_to_encode = self.timestamps[sorted_indices]
-
-                    self.frame_ref_counts[locked_indices] += 1
-
-                    # Instead of calling ffmpeg here, put a job on the queue
-                    encoding_job = {
-                        'frames': frames_to_encode,
-                        'timestamps': timestamps_to_encode,
-                        'quality': job['quality'],
-                        'locked_indices': locked_indices # Pass this through
-                    }
-                    self.encoding_task_queue.put(encoding_job)
-                    # We no longer need to manage pending_encodes dict here
-                else:
-                    print(f"  - Warning: No frames found for video encode job in range [{job['start_time']:.2f}s, {job['end_time']:.2f}s].")
-
-        # --- Step 4: Log Metadata ---
-        # Log all events from the chunk, some of which may now be enriched with image pointers.
-        self.log_events_from_results(events_to_log)
-        
-        # --- Step 5: Cleanup Chunk State ---
-        del self.ref_counts[chunk_id]
-        del self.dispatch_times[chunk_id]
-
-    def log_events_from_results(self, collected_results):
-        """
-        Processes results from workers and puts the resulting events onto the
-        persistence queue instead of a local list.
-        """
-        for result_group in collected_results:
-            for event_data in result_group['data']:
-                event = {
-                    "event_id": str(uuid.uuid4()),
-                    "stream_type": event_data.get("type", "UNKNOWN"),
-                    "start_timestamp": event_data.get("timestamp"),
-                    "delta_timestamp": 0.0, # Instantaneous salience event
-                    "payload_json": orjson.dumps(event_data).decode('utf-8')
-                }
-                self.event_persistence_queue.put(event)
-
-    def _start_baseline_recorder(self):
-        """Launches the persistent ffmpeg process for the low-quality baseline video."""
-        print("Starting low-quality baseline recorder...")
+        print("Starting main orchestration loop... Press Ctrl+C to stop.")
         try:
-            # The VideoEncoder needs a new method to handle this.
-            # It will return the process object and its stdin pipe.
-            self.baseline_proc, self.baseline_encoder_pipe = self.video_encoder.start_continuous_encode(
-                dimensions=self.capture_dims,
-                fps=self.config['capture_fps'], # The pipe needs a target FPS
-                quality='VERY_LOW'
-            )
-        except Exception as e:
-            print(f"CRITICAL ERROR: Failed to start baseline recorder: {e}")
+            while self.is_running:
+                # --- Main Orchestration Loop ---
+                # This loop is now very simple and fast.
+                
+                # 1. Check for results from salience workers
+                if not self.salience_results_queue.empty():
+                    result = self.salience_results_queue.get_nowait()
+                    self.process_salience_results(result)
 
-    def _restart_baseline_recorder(self):
-        """Handles the case where the persistent ffmpeg process crashes."""
-        if self.baseline_proc:
-            self.baseline_proc.kill() # Ensure the old process is gone
-        self.baseline_encoder_pipe = None
-        self.last_baseline_frame_ts = 0.0
-        self._start_baseline_recorder() # Try to launch a new one
+                # 2. Check for completed video encodes
+                if not self.encoding_results_queue.empty():
+                    result = self.encoding_results_queue.get_nowait()
+                    print(f"Orchestrator: Confirmed completion of encode job.")
+                    # In a more complex system, you might log this completion.
+                
+                time.sleep(0.05)
+
+        except (KeyboardInterrupt, SystemExit):
+            self.is_running = False
+        finally:
+            self.shutdown()
+
+    def process_salience_results(self, result: dict):
+        """
+        Processes keyframe events from a salience worker and handles SHM cleanup.
+        """
+        shm_name = result['shm_name']
+        events = result.get('data', [])
+        
+        print(f"Orchestrator: Received {len(events)} events from deep analysis of {shm_name}.")
+        
+        # --- Rule Application ---
+        # A more advanced version would aggregate events to create fewer, longer video clips
+        video_encode_jobs = []
+        for event in events:
+            if event.get('type') == 'VISUAL_KEYFRAME':
+                video_encode_jobs.append({
+                    'start_time': event['timestamp'] - 2.0,
+                    'end_time': event['timestamp'] + 2.0,
+                    'quality': 'HIGH'
+                })
+        
+        # --- Dispatch Encoding Tasks ---
+        if video_encode_jobs:
+            # We need to re-attach to the SHM to get frame data for the encoder
+            try:
+                shm = shared_memory.SharedMemory(name=shm_name)
+                shape = result['shape']
+                timestamps = result['timestamps']
+                buffer = np.ndarray(shape, dtype=result['dtype'], buffer=shm.buf)
+                
+                # For now, process each job separately. Could be optimized.
+                for job in video_encode_jobs:
+                    mask = (np.array(timestamps) >= job['start_time']) & (np.array(timestamps) <= job['end_time'])
+                    indices = np.where(mask)[0]
+                    if len(indices) > 0:
+                        sorted_indices = sorted(indices, key=lambda i: timestamps[i])
+                        frames_to_encode = buffer[sorted_indices]
+                        timestamps_to_encode = np.array(timestamps)[sorted_indices]
+                        
+                        self.encoding_task_queue.put({
+                            'frames': frames_to_encode,
+                            'timestamps': timestamps_to_encode,
+                            'quality': job['quality'],
+                        })
+                shm.close()
+
+            except FileNotFoundError:
+                print(f"WARNING: Could not find SHM block {shm_name} for encoding. It may have been cleaned up already.")
+
+        # --- Cleanup ---
+        # The salience worker is done with this SHM block, so we can unlink it.
+        try:
+            shm_to_clean = shared_memory.SharedMemory(name=shm_name)
+            shm_to_clean.close()
+            shm_to_clean.unlink()
+            print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
+        except FileNotFoundError:
+            pass # It was already cleaned up, which is fine.
 
     def start_workers(self):
-        # CRITICAL: Clear the list to handle re-initialization after a resize
-        self.processes = [] 
-
-        # --- Step 1: Create and collect ALL worker process objects ---
-
-        # Add encoding workers
-        for _ in range(self.num_encoding_workers):
-            p = Process(target=video_encoding_worker_loop, args=(
-                self.encoding_task_queue,
-                self.encoding_results_queue,
-                self.config['output_path']
-            ))
-            p.daemon = True
+        """Creates and starts all the decoupled processes and threads."""
+        # --- Start Processes ---
+        process_map = {
+            "Capture": (capture_process_loop, (self.raw_frame_queue, self.config, self.shutdown_event)),
+            "Triage": (triage_dispatcher_loop, (self.raw_frame_queue, self.salience_task_queue, self.config, self.shutdown_event)),
+        }
+        for name, (target, args) in process_map.items():
+            p = Process(target=target, args=args, name=name, daemon=True)
             self.processes.append(p)
-
-        # Add OCR Worker
-        self.processes.append(
-            Process(target=analysis_worker_loop, args=(
-                self.task_queues['ocr'], self.return_queue, 'OCRLatentWorker',
-                None, self.config['output_path'], self.shutdown_event
-            ))
-        )
-        # Add Visual Salience Worker
-        self.processes.append(
-            Process(target=analysis_worker_loop, args=(
-                self.task_queues['visual'], self.return_queue, 'SigLIPSalienceWorker',
-                None, self.config['output_path'], self.shutdown_event
-            ))
-        )
-
-        # --- Step 2: Start ALL collected processes in one go ---
+        for i in range(self.num_salience_workers):
+            p = Process(target=analysis_worker_loop, args=(self.salience_task_queue, self.salience_results_queue, 'SigLIPSalienceWorker', None, self.config['output_path'], self.shutdown_event), name=f"Salience-{i}", daemon=True)
+            self.processes.append(p)
+        for i in range(self.num_encoding_workers):
+            p = Process(target=video_encoding_worker_loop, args=(self.encoding_task_queue, self.encoding_results_queue, self.config['output_path']), name=f"Encoder-{i}", daemon=True)
+            self.processes.append(p)
         for p in self.processes:
             p.start()
-        
-        print(f"Started {len(self.processes)} worker processes.")
+
+        print("-> Starting background threads (Input Capture)...")
+        input_thread = Thread(target=input_capture_worker, args=(self.persistence_manager.event_queue,), daemon=True)
+        self.threads.append(input_thread)
+        input_thread.start()
 
     def shutdown(self):
-        """
-        Executes a multi-stage shutdown to ensure all threads, processes,
-        and subprocesses are terminated cleanly.
-        """
-        print("Shutting down manager...")
-        if not self.is_running:
-            return
-
-        # --- Step 1: Signal all primary loops to stop ---
-        # This is the main switch that tells our threads and processes to stop accepting new work.
-        # It's non-blocking and happens instantly.
-        print("-> Signaling all loops to exit...")
+        print("\nShutting down orchestrator...")
+        if not self.is_running: return
         self.is_running = False
-        self.shutdown_event.set() # Crucial for responsive worker shutdown
-
-        # --- Step 2: Gracefully stop the worker processes ---
-        # We send a "poison pill" (None) to each worker's task queue. When a worker
-        # finishes its current job, it will fetch `None` from the queue and exit its loop.
-        # This must be done BEFORE we try to join the processes.
-        print("-> Sending shutdown signal to all worker queues...")
+        print("-> Signaling all processes to exit via event...")
+        self.shutdown_event.set()
         
-        # Signal salience workers
-        for q in self.task_queues.values():
-            try:
-                q.put_nowait(None)
-            except queue.Full:
-                pass # If the queue is full, the worker is busy; it will see shutdown_event
-        
-        # Signal encoding workers (ONLY ONCE)
-        for _ in range(self.num_encoding_workers):
-            try:
-                self.encoding_task_queue.put_nowait(None)
-            except queue.Full:
-                pass
+        print("-> Sending shutdown signals to worker queues...")
+        for _ in range(self.num_salience_workers): self.salience_task_queue.put(None)
+        for _ in range(self.num_encoding_workers): self.encoding_task_queue.put(None)
 
-        # --- Step 3: Wait for main threads to finish ---
-        # We specifically wait for the _capture_loop to stop so that no new data
-        # is written to the buffer while we are tearing everything else down.
-        print("-> Waiting for main threads to complete...")
-        for t in self.threads:
-            if t.is_alive() and not t.daemon:
-                t.join(timeout=2)
+        print("-> Waiting for worker processes to terminate...")
+        for p in self.processes:
+            p.join(timeout=5)
+            if p.is_alive():
+                print(f"WARNING: Process {p.name} ({p.pid}) did not terminate gracefully. Forcing.")
+                p.terminate()
 
-        # --- Step 4: Forcefully clean up all external subprocesses (ffmpeg) ---
-        # These ffmpeg processes are not cooperative; they don't check our shutdown events.
-        # We must terminate them directly to prevent them from becoming orphans.
-        print("-> Terminating all active ffmpeg processes...")
         self.video_encoder.shutdown_all()
-        
-        if hasattr(self, 'baseline_proc') and self.baseline_proc.poll() is None:
-        print("-> Gracefully closing baseline recorder pipe...")
-        if self.baseline_encoder_pipe:
-            try:
-                self.baseline_encoder_pipe.close() # Signal EOF to ffmpeg
-            except Exception as e:
-                print(f"Error closing baseline encoder pipe: {e}")
-
-        print("-> Waiting for baseline recorder to finalize video...")
-        try:
-            # Give ffmpeg a generous amount of time to finish writing the file
-            self.baseline_proc.wait(timeout=10) 
-            print("-> Baseline recorder finished cleanly.")
-        except subprocess.TimeoutExpired:
-            # If it didn't finish, it's stuck. Now we terminate it.
-            print("-> Baseline recorder did not exit, terminating forcefully.")
-            self.baseline_proc.terminate()
-            
-        # --- Step 5: Tear down the main pipeline and join worker processes ---
-        # This is the final cleanup of our own processes and shared memory.
-        # It calls `process.join()`, which waits for the workers to actually exit
-        # after they received the `None` signal in Step 2.
-        self._teardown_capture_pipeline()
-        
-        # --- Step 6: Finalize data persistence ---
-        # This is the very last step. It drains the event queue of any final
-        # events logged during the shutdown and writes them to disk.
         self.persistence_manager.shutdown()
-
         print("-> Shutdown complete.")
 
-# Add this class to recording_stuff.py
+# =====================================================================================
+#  UNCHANGED CLASSES (VideoEncoder, AsyncPersistenceManager)
+# =====================================================================================
 
 class VideoEncoder:
     """
@@ -902,12 +612,13 @@ class AsyncPersistenceManager:
             self.journal_file.close()
         print("Persistence manager shut down.")
 
+# =====================================================================================
+#  MAIN ENTRY POINT
+# =====================================================================================
+
 if __name__ == "__main__":
-    # Ensure a window name is set if not using a fallback
     if RECORDING_WINDOW_NAME is None and CAPTURE_REGION is None:
         print("ERROR: You must set RECORDING_WINDOW_NAME or CAPTURE_REGION.")
-        # In a real app, you might fall back to primary monitor capture,
-        # but for this specific design, we require a target.
         exit(1)
 
     os.makedirs(OUTPUT_PATH, exist_ok=True)
@@ -916,20 +627,19 @@ if __name__ == "__main__":
         "window_name": RECORDING_WINDOW_NAME,
         "region": CAPTURE_REGION,
         "output_path": OUTPUT_PATH,
-        "buffer_seconds": BUFFER_SECONDS,
         "chunk_seconds": CHUNK_SECONDS,
         "capture_fps": CAPTURE_FPS,
+        "triage_threshold": TRIAGE_THRESHOLD,
     }
 
-    manager = None
+    orchestrator = None
     try:
-        manager = MemoryAndDispatchManager(config)
-        manager.run()
+        orchestrator = Orchestrator(config)
+        orchestrator.start()
     except WindowNotFoundError as e:
         print(f"FATAL STARTUP ERROR: {e}")
     except Exception as e:
         print(f"An unexpected error occurred in the main block: {e}")
-
-    finally:
-        if manager:
-            manager.shutdown()
+        # In case of an early crash, we still want to try to shut down
+        if orchestrator:
+            orchestrator.shutdown()
