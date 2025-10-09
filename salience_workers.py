@@ -189,7 +189,7 @@ class BaseSalienceWorker:
                 sentinel_latents = self._get_latents_for_indices(frames_chunk, sentinel_indices) # This returns a tensor already on the correct device.
 
                 # Now use it directly
-                sentinel_distances = (1 - F.cosine_similarity(sentinel_latents[:-1], sentinel_latents[1:], dim=1)).cpu().numpy()
+                sentinel_distances = (1 - F.cosine_similarity(sentinel_latents[:-1], sentinel_latents[1:], dim=1)).cpu().float().numpy()
                 
                 found_hotspot = False
                 max_dist = -1
