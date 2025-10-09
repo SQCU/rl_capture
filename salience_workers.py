@@ -4,10 +4,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import os
+import time  # --- NEW ---
+from tqdm import tqdm # --- NEW ---
 from multiprocessing import shared_memory, Event
 from transformers import AutoModel, AutoProcessor, AutoModelForCausalLM, AutoImageProcessor
 from PIL import Image
 from collections import deque
+import queue # --- NEW ---
+
 
 # --- Helper Classes & Functions (Unchanged) ---
 
@@ -66,6 +70,8 @@ class BaseSalienceWorker:
         self.latent_cache = {} # Cache latents within a single chunk processing call
         self.model = None
         self.processor = None
+        # --- NEW: Add a worker identifier for clear logging ---
+        self.worker_id = f"{self.__class__.__name__}_{os.getpid()}"
 
     def get_default_config(self) -> dict:
         # --- NEW: Configuration for the search ---
@@ -73,23 +79,51 @@ class BaseSalienceWorker:
             "branching_factor": 8, # How many sentinel frames to check per chunk
             "z_score_threshold": 3.0, # Z-score to trigger exhaustive search of a sub-span
             "min_exhaustive_size": 16, # Chunks smaller than this are always processed fully
+            "max_batch_size": 16, # A safe default for most modern GPUs
+            "target_resolution": 224, # The side length
         }
 
     @torch.no_grad()
     def _get_latents_for_indices(self, frames_chunk: list[Image.Image], indices: list[int]) -> torch.Tensor:
-        """Helper to compute or retrieve latents from cache for specific indices."""
+        """
+        --- MODIFIED: This function now slices work into hardware-safe batches. ---
+        Helper to compute or retrieve latents from cache for specific indices.
+        """
         indices_to_compute = [i for i in indices if i not in self.latent_cache]
         
         if indices_to_compute:
-            images_to_process = [frames_chunk[i] for i in indices_to_compute]
+            # --- NEW: Batching loop to prevent VRAM overflow ---
+            # This is the core of the fix. We iterate through the work in chunks.
+            all_newly_computed_latents = {}
             
-            # --- MODIFIED: Use a unified processing method ---
-            new_latents = self._inference(images_to_process)
+            for i in range(0, len(indices_to_compute), self.config['max_batch_size']):
+                # 1. Slice the work into a hardware-safe mini-batch
+                batch_indices_to_compute = indices_to_compute[i : i + self.config['max_batch_size']]
+                
+                images_to_process = [frames_chunk[idx] for idx in batch_indices_to_compute]
+                
+                # 2. Perform inference on just this small batch
+                batch_size = len(images_to_process)
+                start_time = time.time()
+                
+                new_latents_batch = self._inference(images_to_process)
+                
+                if self.device.type == 'cuda': torch.cuda.synchronize()
+                end_time = time.time()
+                elapsed = end_time - start_time
+                it_per_sec = batch_size / elapsed if elapsed > 0 else float('inf')
 
-            for i, latent in zip(indices_to_compute, new_latents):
-                self.latent_cache[i] = latent.to('cpu', non_blocking=True) # Cache on CPU
-        
-        # Retrieve all required latents (now on CPU) and stack them for the current device
+                # The diagnostic print now fires for each mini-batch, giving more granular feedback
+                print(f"[{self.worker_id}] GPU INFERENCE | Batch: {batch_size:<3d} | Time: {elapsed:.3f}s | it/s: {it_per_sec:<8.2f}")
+
+                # 3. Collect the results
+                for idx, latent in zip(batch_indices_to_compute, new_latents_batch):
+                    all_newly_computed_latents[idx] = latent.to('cpu', non_blocking=True)
+            
+            # 4. Update the main cache with all the results from the loops
+            self.latent_cache.update(all_newly_computed_latents)
+
+        # The final step is unchanged: retrieve all required latents from the now-populated cache
         return torch.stack([self.latent_cache[i] for i in indices]).to(self.device)
 
     def _inference(self, images: list[Image.Image]) -> torch.Tensor:
@@ -102,81 +136,88 @@ class BaseSalienceWorker:
 
     def process_chunk(self, frames_chunk: list[Image.Image], timestamps_chunk: list[float], shutdown_event: Event) -> list:
         """
-        --- NEW: Main entry point that kicks off the hierarchical search. ---
+        --- MODIFIED: Main entry point with TQDM progress bars. ---
         """
-        self.latent_cache = {} # Clear cache for each new chunk
+        self.latent_cache = {}
         if not frames_chunk: return []
         
-        # The search queue holds tuples of (start_index, end_index) to investigate
-        search_queue = deque([(0, len(frames_chunk) - 1)])
+        # --- MODIFIED: Queue now stores (start, end, depth) for better logging ---
+        search_queue = deque([(0, len(frames_chunk) - 1, 1)])
         final_events = []
+        
+        # --- NEW: Outer progress bar for the entire chunk search ---
+        with tqdm(total=len(frames_chunk), desc=f"[{self.worker_id}] Search", unit="frame", position=0) as search_pbar:
+            while search_queue:
+                if shutdown_event.is_set():
+                    print(f"[{self.worker_id}] Shutdown detected, aborting chunk processing.")
+                    return []
 
-        while search_queue:
-            if shutdown_event.is_set():
-                print(f"[{os.getpid()}] Shutdown detected, aborting chunk processing.")
-                return [] # Abort gracefully
+                start_idx, end_idx, depth = search_queue.popleft()
+                num_frames_in_span = end_idx - start_idx + 1
 
-            start_idx, end_idx = search_queue.popleft()
-            num_frames_in_span = end_idx - start_idx + 1
+                # Update the main progress bar's description
+                search_pbar.set_postfix_str(f"Queue: {len(search_queue)}, Depth: {depth}")
 
-            if num_frames_in_span <= self.config['min_exhaustive_size']:
-                # --- Base Case: Exhaustive Search ---
-                # This span is small enough, process every frame within it.
-                span_indices = list(range(start_idx, end_idx + 1))
-                if len(span_indices) < 2: continue
-                
-                latents = self._get_latents_for_indices(frames_chunk, span_indices)
-                distances = (1 - F.cosine_similarity(latents[:-1], latents[1:], dim=1)).cpu().numpy()
-
-                for i, distance in enumerate(distances):
-                    mean, std_dev = self.distance_stats.mean, self.distance_stats.std_dev
-                    is_spike = std_dev > 0 and (distance - mean) > (std_dev * self.config['z_score_threshold'])
-
-                    if is_spike:
-                        # The actual event is at the *end* of the pair, so i+1
-                        event_index = start_idx + i + 1
-                        event = self._create_keyframe_event(
-                            timestamps_chunk[event_index],
-                            float(distance),
-                            "exhaustive_search_spike"
-                        )
-                        final_events.append(event)
+                if num_frames_in_span <= self.config['min_exhaustive_size']:
+                    # --- Base Case: Exhaustive Search ---
+                    span_indices = list(range(start_idx, end_idx + 1))
+                    if len(span_indices) < 2:
+                        search_pbar.update(num_frames_in_span) # Mark these frames as processed
+                        continue
                     
-                    self.distance_stats.update(distance)
-                continue
+                    latents = self._get_latents_for_indices(frames_chunk, span_indices)
+                    distances = (1 - F.cosine_similarity(latents[:-1], latents[1:], dim=1)).cpu().numpy()
+                    
+                    # --- NEW: Inner progress bar for the exhaustive scan ---
+                    kernel_desc = f"[{self.worker_id}] Kernel (Depth {depth})"
+                    for i, distance in enumerate(tqdm(distances, desc=kernel_desc, unit="comp", leave=False, position=1)):
+                        mean, std_dev = self.distance_stats.mean, self.distance_stats.std_dev
+                        is_spike = std_dev > 0 and (distance - mean) > (std_dev * self.config['z_score_threshold'])
 
-            # --- Recursive Step: Branching Search ---
-            # 1. Select sentinel frames
-            sentinel_indices = np.linspace(start_idx, end_idx, self.config['branching_factor'], dtype=int).tolist()
-            sentinel_latents = self._get_latents_for_indices(frames_chunk, sentinel_indices)
+                        if is_spike:
+                            event_index = start_idx + i + 1
+                            event = self._create_keyframe_event(timestamps_chunk[event_index], float(distance), "exhaustive_search_spike")
+                            final_events.append(event)
+                        
+                        self.distance_stats.update(distance)
+                    
+                    search_pbar.update(num_frames_in_span) # Mark the whole span as processed
+                    continue
 
-            # 2. Calculate distances between sentinels
-            sentinel_distances = (1 - F.cosine_similarity(sentinel_latents[:-1], sentinel_latents[1:], dim=1)).cpu().numpy()
-            
-            # 3. Analyze sub-spans
-            found_hotspot = False
-            max_dist = -1
-            best_span = None
+                # In process_chunk, recursive step:
+                # --- Single, Efficient Fetch ---
+                sentinel_latents = self._get_latents_for_indices(frames_chunk, sentinel_indices) # This returns a tensor already on the correct device.
 
-            for i, dist in enumerate(sentinel_distances):
-                mean, std_dev = self.distance_stats.mean, self.distance_stats.std_dev
-                is_significant = std_dev > 0 and (dist - mean) > (std_dev * self.config['z_score_threshold'])
+                # Now use it directly
+                sentinel_distances = (1 - F.cosine_similarity(sentinel_latents[:-1], sentinel_latents[1:], dim=1)).cpu().numpy()
                 
-                sub_span_start = sentinel_indices[i]
-                sub_span_end = sentinel_indices[i+1]
-                
-                if is_significant:
-                    # This sub-span is interesting, queue it for a deeper look
-                    search_queue.append((sub_span_start, sub_span_end))
-                    found_hotspot = True
-                
-                if dist > max_dist:
-                    max_dist = dist
-                    best_span = (sub_span_start, sub_span_end)
+                found_hotspot = False
+                max_dist = -1
+                best_span = None
 
-            # 4. If no span was above the threshold, queue only the most different one
-            if not found_hotspot and best_span is not None:
-                search_queue.append(best_span)
+                for i, dist in enumerate(sentinel_distances):
+                    mean, std_dev = self.distance_stats.mean, self.distance_stats.std_dev
+                    is_significant = std_dev > 0 and (dist - mean) > (std_dev * self.config['z_score_threshold'])
+                    
+                    sub_span_start = sentinel_indices[i]
+                    sub_span_end = sentinel_indices[i+1]
+                    
+                    if is_significant:
+                        search_queue.append((sub_span_start, sub_span_end, depth + 1))
+                        found_hotspot = True
+                    
+                    if dist > max_dist:
+                        max_dist = dist
+                        best_span = (sub_span_start, sub_span_end)
+
+                if not found_hotspot and best_span is not None:
+                    search_queue.append((*best_span, depth + 1))
+                
+                # Mark the space between sentinels as "processed" at this depth
+                # This updates the progress bar by 8 (the number of sentinels), 
+                # not by the number of frames that have been "cleared" from the search. 
+                # This will cause the progress bar to behave erratically and likely not finish at exactly 100%. 
+                #search_pbar.update(self.config['branching_factor'])
 
         return final_events
 
@@ -261,12 +302,10 @@ def analysis_worker_loop(task_queue, return_queue, worker_class_name, config, ou
 
     while True:
         try:
-            # --- MODIFIED: Non-blocking check for shutdown before getting a task ---
             if shutdown_event.is_set():
-                print(f"[{os.getpid()}] Shutdown signal received, exiting loop.")
                 break
-
-            task = task_queue.get(timeout=0.1) # Use timeout to remain responsive
+            # --- MODIFIED: Add timeout to keep the loop responsive ---
+            task = task_queue.get(timeout=0.1)
             if task is None:
                 break
 
@@ -280,7 +319,9 @@ def analysis_worker_loop(task_queue, return_queue, worker_class_name, config, ou
             timestamps_data = task['timestamps']
 
             frames_as_images = [Image.fromarray(frame) for frame in frames_data]
-            downscaled_images = [_downscale_image(img, target_pixel_area=384*384) for img in frames_as_images]
+            #delocalize config
+            res = worker_instance.config['target_resolution']
+            downscaled_images = [_downscale_image(img, target_pixel_area=res*res) for img in frames_as_images]
             
             # --- MODIFIED: Call the new hierarchical processor ---
             result_data = worker_instance.process_chunk(downscaled_images, timestamps_data, shutdown_event)
