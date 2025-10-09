@@ -77,7 +77,7 @@ class BaseSalienceWorker:
         # --- NEW: Configuration for the search ---
         return {
             "branching_factor": 8, # How many sentinel frames to check per chunk
-            "z_score_threshold": 0.7, # Z-score to trigger exhaustive search of a sub-span
+            "z_score_threshold": 0.85, # Z-score to trigger exhaustive search of a sub-span
             "min_exhaustive_size": 16, # Chunks smaller than this are always processed fully
             "max_batch_size": 16, # A safe default for most modern GPUs
             "target_resolution": 224, # The side length
@@ -172,9 +172,20 @@ class BaseSalienceWorker:
                     kernel_desc = f"[{self.worker_id}] Kernel (Depth {depth})"
                     for i, distance in enumerate(tqdm(distances, desc=kernel_desc, unit="comp", leave=False, position=1)):
                         mean, std_dev = self.distance_stats.mean, self.distance_stats.std_dev
-                        is_spike = std_dev > 0 and (distance - mean) > (std_dev * self.config['z_score_threshold'])
+                        
+                        # --- NEW: The logging logic ---
+                        is_spike = False
+                        if std_dev > 0:
+                            # Calculate the actual threshold value for this frame
+                            current_threshold = mean + (std_dev * self.config['z_score_threshold'])
+                            is_spike = distance > current_threshold
+                            
+                            # Log the comparison every ~20 frames for clarity without spamming
+                            if (start_idx + i) % 20 == 0: 
+                                print(f"[{self.worker_id}] Check: dist={distance:.4f}, threshold={current_threshold:.4f} (mean={mean:.4f}, std={std_dev:.4f}) -> Spike: {is_spike}")
 
                         if is_spike:
+                            print(f"[{self.worker_id}] KEYFRAME DETECTED! dist={distance:.4f} > threshold={current_threshold:.4f}")
                             event_index = start_idx + i + 1
                             event = self._create_keyframe_event(timestamps_chunk[event_index], float(distance), "exhaustive_search_spike")
                             final_events.append(event)

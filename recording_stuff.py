@@ -140,7 +140,11 @@ def capture_process_loop(raw_frame_queue: Queue, config: dict, shutdown_event: E
                 continue
 
             img = sct.grab(monitor)
-            frame_rgb = np.array(img)[:,:,:3]
+            frame_bgr = np.array(img)[:,:,:3]
+            
+            # --- FIX: Convert from BGR to RGB ---
+            # This uses numpy slicing to reverse the order of the last dimension (the color channels)
+            frame_rgb = frame_bgr[:, :, ::-1]
 
             try:
                 # Put the raw frame and timestamp on the queue
@@ -159,7 +163,7 @@ def capture_process_loop(raw_frame_queue: Queue, config: dict, shutdown_event: E
     print(f"[{os.getpid()}] Capture process finished.")
 
 
-def triage_dispatcher_loop(raw_frame_queue: Queue, salience_task_queue: Queue, config: dict, shutdown_event: Event):
+def triage_dispatcher_loop(raw_frame_queue: Queue, salience_task_queue: Queue, shm_notification_queue: Queue, config: dict, shutdown_event: Event):
     """
     The Brain: Performs cheap, coarse-grained analysis to decide if a chunk of time
     is "boring" or "interesting" enough to be promoted for deep analysis.
@@ -215,8 +219,11 @@ def triage_dispatcher_loop(raw_frame_queue: Queue, salience_task_queue: Queue, c
                         "timestamps": list(timestamps)
                     }
                     salience_task_queue.put(task)
+
+                    # --- NEW: Notify the Orchestrator to claim this block ---
+                    shm_notification_queue.put(shm_name)
                     
-                    shm.close() # Close our handle, the workers will manage its lifetime
+                    shm.close() # The Orchestrator will be responsible for keeping the block alive.
                 else:
                     print(f"[{os.getpid()}] Triage: Boring chunk (max_delta={max_delta:.4f}). Discarding.")
                 
@@ -248,6 +255,11 @@ class Orchestrator:
         self.encoding_results_queue = Queue()
         
         # --- State for managing temporary shared memory blocks ---
+        self.shm_notification_queue = Queue() 
+        self.encoding_task_queue = Queue()
+        self.encoding_results_queue = Queue()
+        
+        # --- MODIFIED: This dictionary will now hold active SHM handles ---
         self.active_shm_blocks = {} # {shm_name: shm_instance}
         
         # High-level components
@@ -268,7 +280,18 @@ class Orchestrator:
             while self.is_running:
                 # --- Main Orchestration Loop ---
                 # This loop is now very simple and fast.
-                
+
+                # --- NEW: Check for and claim new SHM blocks ---
+                if not self.shm_notification_queue.empty():
+                    shm_name = self.shm_notification_queue.get_nowait()
+                    try:
+                        # Open our own handle to the SHM block, keeping it alive.
+                        shm = shared_memory.SharedMemory(name=shm_name)
+                        self.active_shm_blocks[shm_name] = shm
+                        print(f"Orchestrator: Registered and claimed SHM block {shm_name}.")
+                    except FileNotFoundError:
+                        print(f"Orchestrator WARNING: Triage notified of {shm_name}, but it disappeared before we could claim it.")
+
                 # 1. Check for results from salience workers
                 if not self.salience_results_queue.empty():
                     result = self.salience_results_queue.get_nowait()
@@ -340,21 +363,29 @@ class Orchestrator:
                     print(f"WARNING: Could not find SHM block {shm_name} for encoding. It may have been cleaned up already.")
 
             # --- Cleanup ---
-            # The salience worker is done with this SHM block, so we can unlink it.
-            try:
-                shm_to_clean = shared_memory.SharedMemory(name=shm_name)
+            # The salience worker is done, and we have dispatched encoding.
+            # Now we can release our handle and unlink the memory.
+            shm_to_clean = self.active_shm_blocks.pop(shm_name, None)
+            if shm_to_clean:
                 shm_to_clean.close()
                 shm_to_clean.unlink()
                 print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
-            except FileNotFoundError:
-                pass # It was already cleaned up, which is fine.
+            else:
+                print(f"Orchestrator WARNING: Tried to clean up {shm_name}, but it was not in our active registry.")
+                # As a fallback, try to unlink it anyway in case of a state mismatch
+                try:
+                    shm_fallback = shared_memory.SharedMemory(name=shm_name)
+                    shm_fallback.close()
+                    shm_fallback.unlink()
+                except FileNotFoundError:
+                    pass 
 
     def start_workers(self):
         """Creates and starts all the decoupled processes and threads."""
         # --- Start Processes ---
         process_map = {
             "Capture": (capture_process_loop, (self.raw_frame_queue, self.config, self.shutdown_event)),
-            "Triage": (triage_dispatcher_loop, (self.raw_frame_queue, self.salience_task_queue, self.config, self.shutdown_event)),
+            "Triage": (triage_dispatcher_loop, (self.raw_frame_queue, self.salience_task_queue, self.shm_notification_queue, self.config, self.shutdown_event)),
         }
         for name, (target, args) in process_map.items():
             p = Process(target=target, args=args, name=name, daemon=True)
@@ -390,9 +421,14 @@ class Orchestrator:
             if p.is_alive():
                 print(f"WARNING: Process {p.name} ({p.pid}) did not terminate gracefully. Forcing.")
                 p.terminate()
-
+                
         self.video_encoder.shutdown_all()
         self.persistence_manager.shutdown()
+        print("-> Cleaning up any orphaned SHM blocks...")
+        for name, shm in self.active_shm_blocks.items():
+            print(f"   - Cleaning {name}")
+            shm.close()
+            shm.unlink()
         print("-> Shutdown complete.")
 
 # =====================================================================================
