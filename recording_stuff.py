@@ -12,7 +12,8 @@ import os
 import io
 import numpy as np
 import subprocess
-from multiprocessing import Process, Queue, shared_memory
+import queue # For the queue.Empty exception
+from multiprocessing import Process, Queue, shared_memory, Event # --- MODIFIED ---
 from threading import Thread, Lock
 from PIL import Image
 
@@ -99,6 +100,8 @@ class MemoryAndDispatchManager:
 
         self.pipeline_lock = Lock()
         self.window_finder = get_window_finder()
+        # --- NEW: Shared event for graceful shutdown ---
+        self.shutdown_event = Event()
         
         # --- NEW: Instantiate the Persistence Manager ---
         parquet_path = os.path.join(self.config['output_path'], "events.parquet")
@@ -165,14 +168,18 @@ class MemoryAndDispatchManager:
     def _teardown_capture_pipeline(self):
         """Gracefully shuts down workers and releases shared memory."""
         print("Tearing down capture pipeline...")
+        self.shutdown_event.set()
         # Signal workers to stop by putting None on their queues
+                # Signal workers to stop by putting None on their queues (as a fallback)
         for q in self.task_queues.values():
             q.put(None)
         
         # Wait for worker processes to finish
         for p in self.processes:
-            p.join(timeout=5)
-            if p.is_alive(): p.terminate()
+            p.join(timeout=5) # Give them 5 seconds to finish up
+            if p.is_alive():
+                print(f"Worker {p.pid} did not exit gracefully, terminating.")
+                p.terminate() # Forcefully terminate if they're still stuck
         self.processes = []
 
         # Release the shared memory block
@@ -520,14 +527,14 @@ class MemoryAndDispatchManager:
         self.processes.append(
             Process(target=analysis_worker_loop, args=(
                 self.task_queues['ocr'], self.return_queue, 'OCRLatentWorker',
-                None, self.config['output_path']
+                None, self.config['output_path'], self.shutdown_event
             ))
         )
         # Visual Salience Worker
         self.processes.append(
             Process(target=analysis_worker_loop, args=(
                 self.task_queues['visual'], self.return_queue, 'SigLIPSalienceWorker',
-                None, self.config['output_path']
+                None, self.config['output_path'], self.shutdown_event
             ))
         )
         for p in self.processes:
@@ -538,6 +545,10 @@ class MemoryAndDispatchManager:
         if not self.is_running: return
 
         self.is_running = False
+
+        # --- MODIFIED: Set the event as the primary shutdown signal ---
+        # This will be seen by workers almost immediately.
+        self.shutdown_event.set()
         
         for t in self.threads:
             if t.is_alive() and not t.isDaemon():
