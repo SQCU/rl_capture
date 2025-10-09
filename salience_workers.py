@@ -77,7 +77,7 @@ class BaseSalienceWorker:
         # --- NEW: Configuration for the search ---
         return {
             "branching_factor": 8, # How many sentinel frames to check per chunk
-            "z_score_threshold": 3.0, # Z-score to trigger exhaustive search of a sub-span
+            "z_score_threshold": 0.7, # Z-score to trigger exhaustive search of a sub-span
             "min_exhaustive_size": 16, # Chunks smaller than this are always processed fully
             "max_batch_size": 16, # A safe default for most modern GPUs
             "target_resolution": 224, # The side length
@@ -186,6 +186,7 @@ class BaseSalienceWorker:
 
                 # In process_chunk, recursive step:
                 # --- Single, Efficient Fetch ---
+                sentinel_indices = np.linspace(start_idx, end_idx, self.config['branching_factor'], dtype=int)
                 sentinel_latents = self._get_latents_for_indices(frames_chunk, sentinel_indices) # This returns a tensor already on the correct device.
 
                 # Now use it directly
@@ -314,10 +315,11 @@ def analysis_worker_loop(task_queue, return_queue, worker_class_name, config, ou
                 shm = shared_memory.SharedMemory(name=task['shm_name'])
                 buffer = np.ndarray(task['shape'], dtype=task['dtype'], buffer=shm.buf)
             
-            frame_indices = np.arange(task['start'], task['start'] + task['num']) % task['shape'][0]
-            frames_data = buffer[frame_indices]
+            # The SHM buffer *is* the chunk. Access it directly.
+            frames_data = buffer 
             timestamps_data = task['timestamps']
 
+            # Create PIL images from the numpy array chunk
             frames_as_images = [Image.fromarray(frame) for frame in frames_data]
             #delocalize config
             res = worker_instance.config['target_resolution']
@@ -326,16 +328,16 @@ def analysis_worker_loop(task_queue, return_queue, worker_class_name, config, ou
             # --- MODIFIED: Call the new hierarchical processor ---
             result_data = worker_instance.process_chunk(downscaled_images, timestamps_data, shutdown_event)
             
-            if result_data:
-                return_message = {
-                    "shm_name": task['shm_name'],     # Pass this through
-                    "shape": task['shape'],           # Pass this through
-                    "dtype": task['dtype'],           # Pass this through
-                    "timestamps": task['timestamps'], # Pass this through
-                    "source": worker_class_name,
-                    "data": result_data
-                }
-                return_queue.put(return_message)
+            # ALWAYS report back, even if empty
+            return_message = {
+                "shm_name": task['shm_name'],     # Pass this through
+                "shape": task['shape'],           # Pass this through
+                "dtype": task['dtype'],           # Pass this through
+                "timestamps": task['timestamps'], # Pass this through
+                "source": worker_class_name,
+                "data": result_data
+            }
+            return_queue.put(return_message)
         
         except queue.Empty: # Comes from task_queue.get(timeout=0.1)
             continue # This is normal, just loop again and check for shutdown
@@ -346,6 +348,7 @@ def analysis_worker_loop(task_queue, return_queue, worker_class_name, config, ou
             print(f"[{os.getpid()}] Error in worker loop: {e}")
             import traceback
             traceback.print_exc() # Print full traceback for debugging
+            raise e
             
     if shm: shm.close()
     print(f"[{os.getpid()}] Worker process {worker_class_name} finished.")

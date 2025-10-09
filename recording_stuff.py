@@ -294,56 +294,60 @@ class Orchestrator:
         shm_name = result['shm_name']
         events = result.get('data', [])
         
-        print(f"Orchestrator: Received {len(events)} events from deep analysis of {shm_name}.")
-        
-        # --- Rule Application ---
-        # A more advanced version would aggregate events to create fewer, longer video clips
-        video_encode_jobs = []
-        for event in events:
-            if event.get('type') == 'VISUAL_KEYFRAME':
-                video_encode_jobs.append({
-                    'start_time': event['timestamp'] - 2.0,
-                    'end_time': event['timestamp'] + 2.0,
-                    'quality': 'HIGH'
-                })
-        
-        # --- Dispatch Encoding Tasks ---
-        if video_encode_jobs:
-            # We need to re-attach to the SHM to get frame data for the encoder
+        # ← Add this:
+        if not events:
+            print(f"Orchestrator: Deep analysis of {shm_name} found NO keyframes. Cleaning up.")
+        else:
+            print(f"Orchestrator: Received {len(events)} events from {shm_name}.")
+            
+            # --- Rule Application ---
+            # A more advanced version would aggregate events to create fewer, longer video clips
+            video_encode_jobs = []
+            for event in events:
+                if event.get('type') == 'VISUAL_KEYFRAME':
+                    video_encode_jobs.append({
+                        'start_time': event['timestamp'] - 2.0,
+                        'end_time': event['timestamp'] + 2.0,
+                        'quality': 'HIGH'
+                    })
+            
+            # --- Dispatch Encoding Tasks ---
+            if video_encode_jobs:
+                # We need to re-attach to the SHM to get frame data for the encoder
+                try:
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    shape = result['shape']
+                    timestamps = result['timestamps']
+                    buffer = np.ndarray(shape, dtype=result['dtype'], buffer=shm.buf)
+                    
+                    # For now, process each job separately. Could be optimized.
+                    for job in video_encode_jobs:
+                        mask = (np.array(timestamps) >= job['start_time']) & (np.array(timestamps) <= job['end_time'])
+                        indices = np.where(mask)[0]
+                        if len(indices) > 0:
+                            sorted_indices = sorted(indices, key=lambda i: timestamps[i])
+                            frames_to_encode = buffer[sorted_indices]
+                            timestamps_to_encode = np.array(timestamps)[sorted_indices]
+                            
+                            self.encoding_task_queue.put({
+                                'frames': frames_to_encode,
+                                'timestamps': timestamps_to_encode,
+                                'quality': job['quality'],
+                            })
+                    shm.close()
+
+                except FileNotFoundError:
+                    print(f"WARNING: Could not find SHM block {shm_name} for encoding. It may have been cleaned up already.")
+
+            # --- Cleanup ---
+            # The salience worker is done with this SHM block, so we can unlink it.
             try:
-                shm = shared_memory.SharedMemory(name=shm_name)
-                shape = result['shape']
-                timestamps = result['timestamps']
-                buffer = np.ndarray(shape, dtype=result['dtype'], buffer=shm.buf)
-                
-                # For now, process each job separately. Could be optimized.
-                for job in video_encode_jobs:
-                    mask = (np.array(timestamps) >= job['start_time']) & (np.array(timestamps) <= job['end_time'])
-                    indices = np.where(mask)[0]
-                    if len(indices) > 0:
-                        sorted_indices = sorted(indices, key=lambda i: timestamps[i])
-                        frames_to_encode = buffer[sorted_indices]
-                        timestamps_to_encode = np.array(timestamps)[sorted_indices]
-                        
-                        self.encoding_task_queue.put({
-                            'frames': frames_to_encode,
-                            'timestamps': timestamps_to_encode,
-                            'quality': job['quality'],
-                        })
-                shm.close()
-
+                shm_to_clean = shared_memory.SharedMemory(name=shm_name)
+                shm_to_clean.close()
+                shm_to_clean.unlink()
+                print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
             except FileNotFoundError:
-                print(f"WARNING: Could not find SHM block {shm_name} for encoding. It may have been cleaned up already.")
-
-        # --- Cleanup ---
-        # The salience worker is done with this SHM block, so we can unlink it.
-        try:
-            shm_to_clean = shared_memory.SharedMemory(name=shm_name)
-            shm_to_clean.close()
-            shm_to_clean.unlink()
-            print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
-        except FileNotFoundError:
-            pass # It was already cleaned up, which is fine.
+                pass # It was already cleaned up, which is fine.
 
     def start_workers(self):
         """Creates and starts all the decoupled processes and threads."""
