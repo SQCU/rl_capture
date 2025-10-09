@@ -166,7 +166,7 @@ class BaseSalienceWorker:
                         continue
                     
                     latents = self._get_latents_for_indices(frames_chunk, span_indices)
-                    distances = (1 - F.cosine_similarity(latents[:-1], latents[1:], dim=1)).cpu().numpy()
+                    distances = (1 - F.cosine_similarity(latents[:-1], latents[1:], dim=1)).cpu().float().numpy()
                     
                     # --- NEW: Inner progress bar for the exhaustive scan ---
                     kernel_desc = f"[{self.worker_id}] Kernel (Depth {depth})"

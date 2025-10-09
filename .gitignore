@@ -1,6 +1,8 @@
-models/**
-
-capture_run_*/
-
 .venv/**
 __pycache__/**
+# Ignore the vendor binaries
+vendor/
+# ignore dnns
+models/**
+# ignore capture runs
+capture_run_*/

@@ -86,6 +86,34 @@ def input_capture_worker(event_queue: Queue):
     print("Input listener started.")
     keyboard_listener.join() # This blocks until the listener stops
 
+def video_encoding_worker_loop(task_queue, result_queue, output_path):
+    # This worker gets its own encoder instance
+    video_encoder = VideoEncoder(output_path)
+    print(f"[{os.getpid()}] Encoding worker started.")
+    
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+
+        frames = task['frames']
+        timestamps = task['timestamps']
+        quality = task['quality']
+        locked_indices = task['locked_indices']
+
+        # This call now happens inside the isolated worker process
+        proc = video_encoder.start_encode_slice(frames, timestamps, quality)
+        
+        if proc:
+            # This is the crucial part: the WORKER waits, not the main loop
+            return_code = proc.wait() 
+            print(f"[{os.getpid()}] Encoding job finished with code {return_code}.")
+
+        # Signal completion back to the main loop
+        result_queue.put({'locked_indices': locked_indices})
+
+    print(f"[{os.getpid()}] Encoding worker finished.")
+
 class MemoryAndDispatchManager:
     def __init__(self, config):
         self.config = config
@@ -97,6 +125,9 @@ class MemoryAndDispatchManager:
         self.return_queue = Queue()
         # This queue is now shared with the persistence manager
         self.event_persistence_queue = Queue() 
+        self.encoding_task_queue = Queue()
+        self.encoding_results_queue = Queue() # To get completion signals
+        self.num_encoding_workers = 2 # A sensible default
 
         self.pipeline_lock = Lock()
         self.window_finder = get_window_finder()
@@ -222,7 +253,13 @@ class MemoryAndDispatchManager:
                         self.results[chunk_id].append(result)
                         self.ref_counts[chunk_id] -= 1
                 # --- NEW: Section for Monitoring Pending Encodes ---
-                self._check_pending_encodes()
+                # --- MODIFIED: Replace _check_pending_encodes with this ---
+                while not self.encoding_results_queue.empty():
+                    result = self.encoding_results_queue.get_nowait()
+                    locked_indices = result['locked_indices']
+                    with self.pipeline_lock:
+                        self.frame_ref_counts[locked_indices] -= 1
+                    print(f"Released frame locks for a completed encode.")
 
                 for chunk_id in list(self.ref_counts.keys()):
                     is_timed_out = (time.time() - self.dispatch_times.get(chunk_id, time.time())) > 10.0
@@ -456,23 +493,29 @@ class MemoryAndDispatchManager:
         # Execute Video Encoding (Asynchronous, Slow)
         # Note: We might have multiple overlapping jobs; a more advanced implementation could merge them.
         # For now, we process them as they came.
+        # --- MODIFIED: Offload the encode job instead of running it ---
         for job in video_encode_jobs:
             with self.pipeline_lock:
+                # This logic was missing. It calculates which frames fall within the job's time range.
                 valid_indices_mask = (self.timestamps >= job['start_time']) & (self.timestamps <= job['end_time'])
                 locked_indices = np.where(valid_indices_mask)[0]
-
                 if len(locked_indices) > 0:
-                    self.frame_ref_counts[locked_indices] += 1
-                    
+                    # Sort indices chronologically to ensure video frames are in the correct order
                     sorted_indices = sorted(locked_indices, key=lambda i: self.timestamps[i])
                     frames_to_encode = self.buffer[sorted_indices]
                     timestamps_to_encode = self.timestamps[sorted_indices]
 
-                    future = self.video_encoder.start_encode_slice(frames_to_encode, timestamps_to_encode, job['quality'])
-                    if future:
-                        job_id = self.next_encode_job_id
-                        self.pending_encodes[job_id] = (future, sorted_indices)
-                        self.next_encode_job_id += 1
+                    self.frame_ref_counts[locked_indices] += 1
+
+                    # Instead of calling ffmpeg here, put a job on the queue
+                    encoding_job = {
+                        'frames': frames_to_encode,
+                        'timestamps': timestamps_to_encode,
+                        'quality': job['quality'],
+                        'locked_indices': locked_indices # Pass this through
+                    }
+                    self.encoding_task_queue.put(encoding_job)
+                    # We no longer need to manage pending_encodes dict here
                 else:
                     print(f"  - Warning: No frames found for video encode job in range [{job['start_time']:.2f}s, {job['end_time']:.2f}s].")
 
@@ -523,54 +566,122 @@ class MemoryAndDispatchManager:
         self._start_baseline_recorder() # Try to launch a new one
 
     def start_workers(self):
-        # OCR Worker
+        # CRITICAL: Clear the list to handle re-initialization after a resize
+        self.processes = [] 
+
+        # --- Step 1: Create and collect ALL worker process objects ---
+
+        # Add encoding workers
+        for _ in range(self.num_encoding_workers):
+            p = Process(target=video_encoding_worker_loop, args=(
+                self.encoding_task_queue,
+                self.encoding_results_queue,
+                self.config['output_path']
+            ))
+            p.daemon = True
+            self.processes.append(p)
+
+        # Add OCR Worker
         self.processes.append(
             Process(target=analysis_worker_loop, args=(
                 self.task_queues['ocr'], self.return_queue, 'OCRLatentWorker',
                 None, self.config['output_path'], self.shutdown_event
             ))
         )
-        # Visual Salience Worker
+        # Add Visual Salience Worker
         self.processes.append(
             Process(target=analysis_worker_loop, args=(
                 self.task_queues['visual'], self.return_queue, 'SigLIPSalienceWorker',
                 None, self.config['output_path'], self.shutdown_event
             ))
         )
+
+        # --- Step 2: Start ALL collected processes in one go ---
         for p in self.processes:
             p.start()
+        
+        print(f"Started {len(self.processes)} worker processes.")
 
     def shutdown(self):
+        """
+        Executes a multi-stage shutdown to ensure all threads, processes,
+        and subprocesses are terminated cleanly.
+        """
         print("Shutting down manager...")
-        if not self.is_running: return
+        if not self.is_running:
+            return
 
+        # --- Step 1: Signal all primary loops to stop ---
+        # This is the main switch that tells our threads and processes to stop accepting new work.
+        # It's non-blocking and happens instantly.
+        print("-> Signaling all loops to exit...")
         self.is_running = False
+        self.shutdown_event.set() # Crucial for responsive worker shutdown
 
-        # --- MODIFIED: Set the event as the primary shutdown signal ---
-        # This will be seen by workers almost immediately.
-        self.shutdown_event.set()
+        # --- Step 2: Gracefully stop the worker processes ---
+        # We send a "poison pill" (None) to each worker's task queue. When a worker
+        # finishes its current job, it will fetch `None` from the queue and exit its loop.
+        # This must be done BEFORE we try to join the processes.
+        print("-> Sending shutdown signal to all worker queues...")
         
+        # Signal salience workers
+        for q in self.task_queues.values():
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass # If the queue is full, the worker is busy; it will see shutdown_event
+        
+        # Signal encoding workers (ONLY ONCE)
+        for _ in range(self.num_encoding_workers):
+            try:
+                self.encoding_task_queue.put_nowait(None)
+            except queue.Full:
+                pass
+
+        # --- Step 3: Wait for main threads to finish ---
+        # We specifically wait for the _capture_loop to stop so that no new data
+        # is written to the buffer while we are tearing everything else down.
+        print("-> Waiting for main threads to complete...")
         for t in self.threads:
-            if t.is_alive() and not t.isDaemon():
+            if t.is_alive() and not t.daemon:
                 t.join(timeout=2)
 
+        # --- Step 4: Forcefully clean up all external subprocesses (ffmpeg) ---
+        # These ffmpeg processes are not cooperative; they don't check our shutdown events.
+        # We must terminate them directly to prevent them from becoming orphans.
+        print("-> Terminating all active ffmpeg processes...")
+        self.video_encoder.shutdown_all()
+        
+        if hasattr(self, 'baseline_proc') and self.baseline_proc.poll() is None:
+        print("-> Gracefully closing baseline recorder pipe...")
         if self.baseline_encoder_pipe:
             try:
-                self.baseline_encoder_pipe.close()
+                self.baseline_encoder_pipe.close() # Signal EOF to ffmpeg
             except Exception as e:
                 print(f"Error closing baseline encoder pipe: {e}")
-        
-        # Wait for the baseline process to finish writing its file
-        if hasattr(self, 'baseline_proc') and self.baseline_proc.poll() is None:
-            self.baseline_proc.wait(timeout=5)
-            if self.baseline_proc.poll() is None:
-                self.baseline_proc.kill()
 
+        print("-> Waiting for baseline recorder to finalize video...")
+        try:
+            # Give ffmpeg a generous amount of time to finish writing the file
+            self.baseline_proc.wait(timeout=10) 
+            print("-> Baseline recorder finished cleanly.")
+        except subprocess.TimeoutExpired:
+            # If it didn't finish, it's stuck. Now we terminate it.
+            print("-> Baseline recorder did not exit, terminating forcefully.")
+            self.baseline_proc.terminate()
+            
+        # --- Step 5: Tear down the main pipeline and join worker processes ---
+        # This is the final cleanup of our own processes and shared memory.
+        # It calls `process.join()`, which waits for the workers to actually exit
+        # after they received the `None` signal in Step 2.
         self._teardown_capture_pipeline()
         
-        # --- NEW: Shutdown the persistence manager ---
-        # This will handle the final write and close the file.
+        # --- Step 6: Finalize data persistence ---
+        # This is the very last step. It drains the event queue of any final
+        # events logged during the shutdown and writes them to disk.
         self.persistence_manager.shutdown()
+
+        print("-> Shutdown complete.")
 
 # Add this class to recording_stuff.py
 
@@ -581,6 +692,8 @@ class VideoEncoder:
     def __init__(self, output_path: str):
         self.output_path = output_path
         os.makedirs(os.path.join(self.output_path, "videos"), exist_ok=True)
+        self.active_processes = [] # Keep track of all processes
+        self.lock = Lock() # To safely append to the list from multiple workers
 
     def start_encode_slice(self, frames: np.ndarray, timestamps: np.ndarray, quality: str) -> subprocess.Popen:
         """
@@ -635,6 +748,9 @@ class VideoEncoder:
 
         # Start the process with stdin piped
         proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        with self.lock:
+            self.active_processes.append(proc)
         
         # Write all frame data to the pipe in a separate thread to avoid blocking
         def pipe_frames():
@@ -688,6 +804,15 @@ class VideoEncoder:
         proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         
         return proc, proc.stdin
+
+    def shutdown_all(self):
+        with self.lock:
+            for proc in self.active_processes:
+                if proc.poll() is None: # If the process is still running
+                    try:
+                        proc.terminate() # Send SIGTERM
+                    except Exception as e:
+                        print(f"Error terminating ffmpeg process {proc.pid}: {e}")
 
 class AsyncPersistenceManager:
     """
