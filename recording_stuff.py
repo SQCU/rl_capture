@@ -49,7 +49,7 @@ STRATEGY_CONFIGS = {
     "pca_mahalanobis": {
         "pca_n_components": 16,      # Max components (top-k guardrail).
         "pca_variance_threshold": 0.95, # The variance to capture (top-p).
-        "novelty_z_score_threshold": 2.0, # Z-score threshold for the Mahalanobis scores themselves.
+        "novelty_z_score_threshold": 1.0, # Z-score threshold for the Mahalanobis scores themselves.
         "branching_factor": 8, # Override the worker's default of 8
         "min_exhaustive_size": 16, # Override the worker's default of 16
     }
@@ -349,6 +349,16 @@ class Orchestrator:
         keyframes = data.get('keyframes', [])
         search_log = data.get('search_log', [])
 
+        shm_to_clean = self.active_shm_blocks.pop(shm_name, None)
+        if shm_to_clean:
+            shm_to_clean.close()
+            shm_to_clean.unlink()
+            print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
+        else:
+            # This can happen in rare race conditions on shutdown, it's safe to log.
+            print(f"Orchestrator WARNING: Worker reported on {shm_name}, but it was not in our active registry.")
+
+        # --- Now, handle the results ---
         print(f"Orchestrator: Received {len(keyframes)} keyframes and {len(search_log)} search log entries from {shm_name}.")
 
         # --- NEW: Persist the search log for a detailed timeline ---
