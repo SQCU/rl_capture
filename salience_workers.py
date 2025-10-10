@@ -12,30 +12,8 @@ from PIL import Image
 from collections import deque
 import queue # --- NEW ---
 
-
-# --- Helper Classes & Functions (Unchanged) ---
-
-class OnlineStats:
-    """Implements Welford's algorithm for stable online variance calculation."""
-    def __init__(self):
-        self.n = 0
-        self.mean = 0.0
-        self.M2 = 0.0
-
-    def update(self, new_value: float):
-        self.n += 1
-        delta = new_value - self.mean
-        self.mean += delta / self.n
-        delta2 = new_value - self.mean
-        self.M2 += delta * delta2
-
-    @property
-    def variance(self) -> float:
-        return self.M2 / self.n if self.n > 1 else 0.0
-
-    @property
-    def std_dev(self) -> float:
-        return self.variance**0.5
+# --- NEW: Import our new tracker classes ---
+from salience_trackers import NaiveZScoreTracker, PCAMahanalobisTracker, TRACKER_STRATEGIES
 
 def _downscale_image(img: Image.Image, target_pixel_area: int = 512*512) -> Image.Image:
     """
@@ -53,313 +31,237 @@ def _downscale_image(img: Image.Image, target_pixel_area: int = 512*512) -> Imag
 
     return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-# --- Base Worker with Hierarchical Logic ---
+# =====================================================================================
+#  NEW ARCHITECTURE: Salience Kernels (The "Experts")
+# =====================================================================================
 
-class BaseSalienceWorker:
+class SalienceKernel:
     """
-    --- NEW ---
-    A base class that contains the shared hierarchical search logic.
+    Abstract Base Class for a self-contained "expert" on one type of salience.
+    It bundles a model with its own private statistical tracker.
     """
-    def __init__(self, config, output_path):
-        self.config = self.get_default_config()
-        if config: self.config.update(config)
+    def __init__(self, config: dict, device):
+        self.kernel_name = "BaseKernel"
+        self.device = device
+        self.config = config
         
-        self.output_path = output_path
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.distance_stats = OnlineStats()
-        self.latent_cache = {} # Cache latents within a single chunk processing call
-        self.model = None
-        self.processor = None
-        # --- NEW: Add a worker identifier for clear logging ---
-        self.worker_id = f"{self.__class__.__name__}_{os.getpid()}"
-
-    def get_default_config(self) -> dict:
-        # --- NEW: Configuration for the search ---
-        return {
-            "branching_factor": 8, # How many sentinel frames to check per chunk
-            "z_score_threshold": 0.85, # Z-score to trigger exhaustive search of a sub-span
-            "min_exhaustive_size": 16, # Chunks smaller than this are always processed fully
-            "max_batch_size": 16, # A safe default for most modern GPUs
-            "target_resolution": 224, # The side length
-        }
+        # Each kernel gets its own, independent statistical tracker.
+        tracker_class = TRACKER_STRATEGIES[config['salience_strategy']]
+        self.tracker = tracker_class(config)
+        print(f"[{self.kernel_name}_{os.getpid()}] Initialized with tracker: {config['salience_strategy']}")
 
     @torch.no_grad()
-    def _get_latents_for_indices(self, frames_chunk: list[Image.Image], indices: list[int]) -> torch.Tensor:
-        """
-        --- MODIFIED: This function now slices work into hardware-safe batches. ---
-        Helper to compute or retrieve latents from cache for specific indices.
-        """
-        indices_to_compute = [i for i in indices if i not in self.latent_cache]
-        
-        if indices_to_compute:
-            # --- NEW: Batching loop to prevent VRAM overflow ---
-            # This is the core of the fix. We iterate through the work in chunks.
-            all_newly_computed_latents = {}
-            
-            for i in range(0, len(indices_to_compute), self.config['max_batch_size']):
-                # 1. Slice the work into a hardware-safe mini-batch
-                batch_indices_to_compute = indices_to_compute[i : i + self.config['max_batch_size']]
-                
-                images_to_process = [frames_chunk[idx] for idx in batch_indices_to_compute]
-                
-                # 2. Perform inference on just this small batch
-                batch_size = len(images_to_process)
-                start_time = time.time()
-                
-                new_latents_batch = self._inference(images_to_process)
-                
-                if self.device.type == 'cuda': torch.cuda.synchronize()
-                end_time = time.time()
-                elapsed = end_time - start_time
-                it_per_sec = batch_size / elapsed if elapsed > 0 else float('inf')
-
-                # The diagnostic print now fires for each mini-batch, giving more granular feedback
-                print(f"[{self.worker_id}] GPU INFERENCE | Batch: {batch_size:<3d} | Time: {elapsed:.3f}s | it/s: {it_per_sec:<8.2f}")
-
-                # 3. Collect the results
-                for idx, latent in zip(batch_indices_to_compute, new_latents_batch):
-                    all_newly_computed_latents[idx] = latent.to('cpu', non_blocking=True)
-            
-            # 4. Update the main cache with all the results from the loops
-            self.latent_cache.update(all_newly_computed_latents)
-
-        # The final step is unchanged: retrieve all required latents from the now-populated cache
-        return torch.stack([self.latent_cache[i] for i in indices]).to(self.device)
-
-    def _inference(self, images: list[Image.Image]) -> torch.Tensor:
-        """This method must be implemented by subclasses."""
+    def get_latents_for_images(self, images: list[Image.Image]) -> torch.Tensor:
+        """Performs inference on a batch of images and returns latents."""
         raise NotImplementedError
 
-    def _create_keyframe_event(self, timestamp: float, distance: float, reason: str) -> dict:
-        """This method must be implemented by subclasses."""
-        raise NotImplementedError
+    def create_keyframe_event(self, timestamp: float, score: float, reason: str) -> dict:
+        """Creates a kernel-specific keyframe event dictionary."""
+        return {
+            "type": f"{self.kernel_name}_KEYFRAME",
+            "timestamp": timestamp, "value": score, "reason": reason
+        }
 
-    def process_chunk(self, frames_chunk: list[Image.Image], timestamps_chunk: list[float], shutdown_event: Event) -> list:
-        """
-        --- MODIFIED: Main entry point with TQDM progress bars. ---
-        """
-        self.latent_cache = {}
-        if not frames_chunk: return []
+class SigLIPKernel(SalienceKernel):
+    """The expert on whole-image visual semantics."""
+    def __init__(self, config: dict, device):
+        super().__init__(config, device)
+        self.kernel_name = "VISUAL_SEMANTIC"
         
-        # --- MODIFIED: Queue now stores (start, end, depth) for better logging ---
-        search_queue = deque([(0, len(frames_chunk) - 1, 1)])
-        final_events = []
-        
-        # --- NEW: Outer progress bar for the entire chunk search ---
-        with tqdm(total=len(frames_chunk), desc=f"[{self.worker_id}] Search", unit="frame", position=0) as search_pbar:
-            while search_queue:
-                if shutdown_event.is_set():
-                    print(f"[{self.worker_id}] Shutdown detected, aborting chunk processing.")
-                    return []
-
-                start_idx, end_idx, depth = search_queue.popleft()
-                num_frames_in_span = end_idx - start_idx + 1
-
-                # Update the main progress bar's description
-                search_pbar.set_postfix_str(f"Queue: {len(search_queue)}, Depth: {depth}")
-
-                if num_frames_in_span <= self.config['min_exhaustive_size']:
-                    # --- Base Case: Exhaustive Search ---
-                    span_indices = list(range(start_idx, end_idx + 1))
-                    if len(span_indices) < 2:
-                        search_pbar.update(num_frames_in_span) # Mark these frames as processed
-                        continue
-                    
-                    latents = self._get_latents_for_indices(frames_chunk, span_indices)
-                    distances = (1 - F.cosine_similarity(latents[:-1], latents[1:], dim=1)).cpu().float().numpy()
-                    
-                    # --- NEW: Inner progress bar for the exhaustive scan ---
-                    kernel_desc = f"[{self.worker_id}] Kernel (Depth {depth})"
-                    for i, distance in enumerate(tqdm(distances, desc=kernel_desc, unit="comp", leave=False, position=1)):
-                        mean, std_dev = self.distance_stats.mean, self.distance_stats.std_dev
-                        
-                        # --- NEW: The logging logic ---
-                        is_spike = False
-                        if std_dev > 0:
-                            # Calculate the actual threshold value for this frame
-                            current_threshold = mean + (std_dev * self.config['z_score_threshold'])
-                            is_spike = distance > current_threshold
-                            
-                            # Log the comparison every ~20 frames for clarity without spamming
-                            if (start_idx + i) % 20 == 0: 
-                                print(f"[{self.worker_id}] Check: dist={distance:.4f}, threshold={current_threshold:.4f} (mean={mean:.4f}, std={std_dev:.4f}) -> Spike: {is_spike}")
-
-                        if is_spike:
-                            print(f"[{self.worker_id}] KEYFRAME DETECTED! dist={distance:.4f} > threshold={current_threshold:.4f}")
-                            event_index = start_idx + i + 1
-                            event = self._create_keyframe_event(timestamps_chunk[event_index], float(distance), "exhaustive_search_spike")
-                            final_events.append(event)
-                        
-                        self.distance_stats.update(distance)
-                    
-                    search_pbar.update(num_frames_in_span) # Mark the whole span as processed
-                    continue
-
-                # In process_chunk, recursive step:
-                # --- Single, Efficient Fetch ---
-                sentinel_indices = np.linspace(start_idx, end_idx, self.config['branching_factor'], dtype=int)
-                sentinel_latents = self._get_latents_for_indices(frames_chunk, sentinel_indices) # This returns a tensor already on the correct device.
-
-                # Now use it directly
-                sentinel_distances = (1 - F.cosine_similarity(sentinel_latents[:-1], sentinel_latents[1:], dim=1)).cpu().float().numpy()
-                
-                found_hotspot = False
-                max_dist = -1
-                best_span = None
-
-                for i, dist in enumerate(sentinel_distances):
-                    mean, std_dev = self.distance_stats.mean, self.distance_stats.std_dev
-                    is_significant = std_dev > 0 and (dist - mean) > (std_dev * self.config['z_score_threshold'])
-                    
-                    sub_span_start = sentinel_indices[i]
-                    sub_span_end = sentinel_indices[i+1]
-                    
-                    if is_significant:
-                        search_queue.append((sub_span_start, sub_span_end, depth + 1))
-                        found_hotspot = True
-                    
-                    if dist > max_dist:
-                        max_dist = dist
-                        best_span = (sub_span_start, sub_span_end)
-
-                if not found_hotspot and best_span is not None:
-                    search_queue.append((*best_span, depth + 1))
-                
-                # Mark the space between sentinels as "processed" at this depth
-                # This updates the progress bar by 8 (the number of sentinels), 
-                # not by the number of frames that have been "cleared" from the search. 
-                # This will cause the progress bar to behave erratically and likely not finish at exactly 100%. 
-                #search_pbar.update(self.config['branching_factor'])
-
-        return final_events
-
-# --- Stateful Worker Implementations ---
-
-class SigLIPSalienceWorker(BaseSalienceWorker):
-    """A stateful worker using SigLIP, now with hierarchical search."""
-    def __init__(self, config: dict, output_path: str):
-        super().__init__(config, output_path)
-        print("Initializing SigLIP Salience Worker...")
         model_path = "./models/siglip"
-        if not os.path.isdir(model_path):
-            raise FileNotFoundError(f"SigLIP model not found at '{model_path}'.")
-
+        if not os.path.isdir(model_path): raise FileNotFoundError(f"SigLIP model not found at '{model_path}'.")
         model_kwargs = {"dtype": torch.bfloat16, "attn_implementation": "sdpa"} if self.device.type == 'cuda' else {}
         self.model = AutoModel.from_pretrained(model_path, **model_kwargs).to(self.device)
         self.processor = AutoProcessor.from_pretrained(model_path)
-        self.vision_encoder = self.model.vision_model
-        self.vision_encoder.eval()
+        self.vision_encoder = self.model.vision_model.eval()
 
-    def _inference(self, images: list[Image.Image]) -> torch.Tensor:
+    @torch.no_grad()
+    def get_latents_for_images(self, images: list[Image.Image]) -> torch.Tensor:
         inputs = self.processor(images=images, return_tensors="pt", padding=True)
         pixel_values = inputs["pixel_values"].to(self.device, dtype=self.model.dtype)
         return self.vision_encoder(pixel_values).pooler_output
 
-    def _create_keyframe_event(self, timestamp: float, distance: float, reason: str) -> dict:
-        return {
-            "type": "VISUAL_KEYFRAME", "timestamp": timestamp,
-            "reason": reason, "value": distance
-        }
-
-
-class OCRLatentWorker(BaseSalienceWorker):
-    """A stateful worker using DOTS.ocr, now with hierarchical search."""
-    def __init__(self, config: dict, output_path: str):
-        super().__init__(config, output_path)
-        print("Initializing OCR Latent Worker...")
+class OCRLatentKernel(SalienceKernel):
+    """The expert on typographic change and drift."""
+    def __init__(self, config: dict, device):
+        super().__init__(config, device)
+        self.kernel_name = "OCR_LATENT"
+        
         model_path = "./models/dots_ocr"
-        if not os.path.isdir(model_path):
-            raise FileNotFoundError(f"DOTS.ocr model not found at '{model_path}'.")
-
+        if not os.path.isdir(model_path): raise FileNotFoundError(f"DOTS.ocr model not found at '{model_path}'.")
         model_kwargs = {"attn_implementation": "sdpa", "dtype": torch.bfloat16} if self.device.type == 'cuda' else {}
-        self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, **model_kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, **model_kwargs).to(self.device)
         self.processor = AutoImageProcessor.from_pretrained(model_path, trust_remote_code=True)
-        self.encoder = self.model.vision_tower.to(device=self.device)
-        self.encoder.eval()
+        self.encoder = self.model.vision_tower.to(device=self.device).eval()
 
-        latents_path = os.path.join(output_path, "latents")
-        os.makedirs(latents_path, exist_ok=True)
-        self.latents_path = latents_path
-
-    def _inference(self, images: list[Image.Image]) -> torch.Tensor:
+    @torch.no_grad()
+    def get_latents_for_images(self, images: list[Image.Image]) -> torch.Tensor:
         inputs = self.processor(images=images, return_tensors="pt")
         pixel_values = inputs['pixel_values'].to(self.device, dtype=self.model.dtype)
         grid_thw = inputs['image_grid_thw'].to(self.device)
-        # Flatten the spatial dimensions to get one vector per frame
         return self.encoder(pixel_values, grid_thw=grid_thw).flatten(start_dim=1)
 
-    def _create_keyframe_event(self, timestamp: float, distance: float, reason: str) -> dict:
-        # For OCR, the event itself doesn't need to save the latent,
-        # but you might want to trigger a separate, more detailed OCR process here.
-        # For now, we'll just log the keyframe.
-        return {
-            "type": "OCR_LATENT_KEYFRAME", "timestamp": timestamp,
-            "reason": reason, "value": distance,
-            "payload": {"model_name": "rednote-hilab/dots.ocr"}
-        }
+# =====================================================================================
+#  NEW ARCHITECTURE: The Search Manager (The "Brain")
+# =====================================================================================
 
-# --- Generic Worker Process Entry Point ---
+class HierarchicalSearchManager:
+    """
+    Manages the recursive search process, polls kernels for novelty,
+    and logs the entire search timeline. It is model-agnostic.
+    """
+    def __init__(self, kernels: list[SalienceKernel], config: dict):
+        self.kernels = kernels
+        self.config = config
+        self.worker_id = f"SearchManager_{os.getpid()}"
+        self.latent_cache = {}
 
-def analysis_worker_loop(task_queue, return_queue, worker_class_name, config, output_path, shutdown_event): # --- MODIFIED ---
-    """
-    The main loop for a worker process. Now checks a shutdown event.
-    """
-    print(f"[{os.getpid()}] Worker process started for: {worker_class_name}")
+    @torch.no_grad()
+    def _get_latents_for_indices(self, frames_chunk: list, indices: list[int]) -> dict[str, torch.Tensor]:
+        indices_to_compute = [i for i in indices if any((k.kernel_name, i) not in self.latent_cache for k in self.kernels)]
+        
+        if indices_to_compute:
+            for i in range(0, len(indices_to_compute), self.config.get('max_batch_size', 16)):
+                batch_indices = indices_to_compute[i : i + self.config.get('max_batch_size', 16)]
+                images_to_process = [frames_chunk[idx] for idx in batch_indices]
+                
+                for kernel in self.kernels:
+                    latents_batch = kernel.get_latents_for_images(images_to_process)
+                    for idx, latent in zip(batch_indices, latents_batch):
+                        self.latent_cache[(kernel.kernel_name, idx)] = latent.to('cpu', non_blocking=True)
+
+        results = {k.kernel_name: [] for k in self.kernels}
+        for i in indices:
+            for k in self.kernels:
+                results[k.kernel_name].append(self.latent_cache[(k.kernel_name, i)])
+        
+        for name, latents in results.items():
+            results[name] = torch.stack(latents).to(self.kernels[0].device)
+        return results
+
+    def _exhaustive_scan(self, frames_chunk: list, timestamps_chunk: list, start_idx: int, end_idx: int, search_log: list) -> list:
+        span_indices = list(range(start_idx, end_idx + 1))
+        if len(span_indices) < 2: return []
+        
+        all_latents = self._get_latents_for_indices(frames_chunk, span_indices)
+        all_keyframes = []
+
+        search_log.append({'type': 'exhaustive_scan', 'span': (timestamps_chunk[start_idx], timestamps_chunk[end_idx]), 'num_frames': len(span_indices)})
+
+        for kernel in self.kernels:
+            latents_np = all_latents[kernel.kernel_name].cpu().numpy()
+            scores = kernel.tracker.get_novelty_scores(latents_np)
+            is_novel_mask = kernel.tracker.is_novel(scores)
+            
+            novel_indices = np.where(is_novel_mask)[0]
+            for i in novel_indices:
+                event_index = start_idx + i
+                event = kernel.create_keyframe_event(timestamps_chunk[event_index], float(scores[i]), "exhaustive_scan_spike")
+                all_keyframes.append(event)
+            
+            kernel.tracker.update(latents_np)
+            
+        return all_keyframes
+
+    def _recursive_search_step(self, frames_chunk: list, search_queue: deque, start_idx: int, end_idx: int, depth: int, search_log: list):
+        sentinel_indices = np.linspace(start_idx, end_idx, self.config.get('branching_factor', 8), dtype=int)
+        all_latents = self._get_latents_for_indices(frames_chunk, sentinel_indices.tolist())
+
+        found_hotspot = False
+        max_score_info = {'score': -1, 'span': None, 'reason': None}
+
+        for i in range(len(sentinel_indices) - 1):
+            sub_span_start, sub_span_end = int(sentinel_indices[i]), int(sentinel_indices[i+1])
+            is_interesting_span = False
+
+            for kernel in self.kernels:
+                latents_np = all_latents[kernel.kernel_name][[i, i+1]].cpu().numpy()
+                score = kernel.tracker.get_novelty_scores(latents_np)[0]
+                
+                if kernel.tracker.is_novel(np.array([score]))[0]:
+                    is_interesting_span = True
+                    search_log.append({'type': 'recursive_descent', 'span_indices': (sub_span_start, sub_span_end), 'reason': f'{kernel.kernel_name}_spike', 'score': float(score)})
+                    break # One kernel is enough to flag the span
+            
+            if is_interesting_span:
+                search_queue.append((sub_span_start, sub_span_end, depth + 1))
+                found_hotspot = True
+            
+            # Keep track of the most different span, regardless of statistical novelty
+            if score > max_score_info['score']:
+                max_score_info.update({'score': score, 'span': (sub_span_start, sub_span_end), 'reason': f'{kernel.kernel_name}_max_score'})
+
+        if not found_hotspot and max_score_info['span'] is not None:
+            search_queue.append((*max_score_info['span'], depth + 1))
+            search_log.append({'type': 'recursive_descent_optimistic', 'span_indices': max_score_info['span'], **max_score_info})
+
+    def process_chunk(self, frames_chunk: list, timestamps_chunk: list, shutdown_event: Event) -> dict:
+        self.latent_cache = {}
+        if not frames_chunk: return {'keyframes': [], 'search_log': []}
+
+        search_queue = deque([(0, len(frames_chunk) - 1, 1)])
+        final_events, search_log = [], []
+
+        with tqdm(total=len(frames_chunk), desc=f"[{self.worker_id}] Search", unit="frame", position=0) as pbar:
+            while search_queue:
+                if shutdown_event.is_set(): break
+                start_idx, end_idx, depth = search_queue.popleft()
+                
+                if (end_idx - start_idx + 1) <= self.config.get('min_exhaustive_size', 16):
+                    keyframes = self._exhaustive_scan(frames_chunk, timestamps_chunk, start_idx, end_idx, search_log)
+                    final_events.extend(keyframes)
+                    pbar.update(end_idx - start_idx + 1)
+                else:
+                    self._recursive_search_step(frames_chunk, search_queue, start_idx, end_idx, depth, search_log)
+        
+        return {'keyframes': final_events, 'search_log': search_log}
+
+# =====================================================================================
+#  The Main Worker Loop (Now much simpler)
+# =====================================================================================
+
+def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown_event):
+    worker_pid = os.getpid()
+    print(f"[{worker_pid}] Analysis worker started.")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- Instantiate all enabled kernels based on config ---
+    kernels_to_load = config.get("salience_kernels", ["siglip"])
+    kernels = []
+    print(f"[{worker_pid}] Loading kernels: {kernels_to_load}")
+    if "siglip" in kernels_to_load:
+        kernels.append(SigLIPKernel(config, device))
+    if "ocr" in kernels_to_load:
+        kernels.append(OCRLatentKernel(config, device))
     
-    worker_class = globals()[worker_class_name]
-    worker_instance = worker_class(config, output_path)
-
-    shm = None
-    buffer = None
+    search_manager = HierarchicalSearchManager(kernels, config)
 
     while True:
         try:
-            if shutdown_event.is_set():
-                break
-            # --- MODIFIED: Add timeout to keep the loop responsive ---
+            if shutdown_event.is_set(): break
             task = task_queue.get(timeout=0.1)
-            if task is None:
-                break
+            if task is None: break
 
-            if shm is None or shm.name != task['shm_name']:
-                if shm: shm.close()
-                shm = shared_memory.SharedMemory(name=task['shm_name'])
-                buffer = np.ndarray(task['shape'], dtype=task['dtype'], buffer=shm.buf)
+            shm = shared_memory.SharedMemory(name=task['shm_name'])
+            buffer = np.ndarray(task['shape'], dtype=task['dtype'], buffer=shm.buf)
             
-            # The SHM buffer *is* the chunk. Access it directly.
-            frames_data = buffer 
-            timestamps_data = task['timestamps']
-
-            # Create PIL images from the numpy array chunk
-            frames_as_images = [Image.fromarray(frame) for frame in frames_data]
-            #delocalize config
-            res = worker_instance.config['target_resolution']
-            downscaled_images = [_downscale_image(img, target_pixel_area=res*res) for img in frames_as_images]
+            frames_as_images = [Image.fromarray(frame) for frame in buffer]
+            downscaled_images = [_downscale_image(img) for img in frames_as_images]
             
-            # --- MODIFIED: Call the new hierarchical processor ---
-            result_data = worker_instance.process_chunk(downscaled_images, timestamps_data, shutdown_event)
+            result_data = search_manager.process_chunk(downscaled_images, task['timestamps'], shutdown_event)
             
-            # ALWAYS report back, even if empty
             return_message = {
-                "shm_name": task['shm_name'],     # Pass this through
-                "shape": task['shape'],           # Pass this through
-                "dtype": task['dtype'],           # Pass this through
-                "timestamps": task['timestamps'], # Pass this through
-                "source": worker_class_name,
-                "data": result_data
+                "shm_name": task['shm_name'], "shape": task['shape'],
+                "dtype": task['dtype'], "timestamps": task['timestamps'],
+                "source": "HierarchicalSearchManager", "data": result_data
             }
             return_queue.put(return_message)
-        
-        except queue.Empty: # Comes from task_queue.get(timeout=0.1)
-            continue # This is normal, just loop again and check for shutdown
-        except (BrokenPipeError, EOFError):
-            print(f"[{os.getpid()}] Communication channel broke. Shutting down worker.")
-            break
+            shm.close()
+
+        except queue.Empty:
+            continue
         except Exception as e:
-            print(f"[{os.getpid()}] Error in worker loop: {e}")
-            import traceback
-            traceback.print_exc() # Print full traceback for debugging
-            raise e
+            print(f"[{worker_pid}] CRITICAL ERROR in worker loop: {e}")
+            import traceback; traceback.print_exc()
             
-    if shm: shm.close()
-    print(f"[{os.getpid()}] Worker process {worker_class_name} finished.")
+    print(f"[{worker_pid}] Analysis worker finished.")

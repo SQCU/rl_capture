@@ -32,6 +32,25 @@ CAPTURE_FPS = 30
 # --- NEW: Triage Configuration ---
 TRIAGE_THRESHOLD = 0.1 # A starting point for max_delta to trigger deep analysis
 
+# --- NEW: Salience Strategy Configuration ---
+# Choose which algorithm to use for novelty detection.
+# Options: "naive_cos_dissimilarity", "pca_mahalanobis"
+SALIENCE_STRATEGY = "naive_cos_dissimilarity"
+SALIENCE_KERNELS = ["siglip"] # Add "ocr" to this list to enable the OCR kernel
+
+# --- NEW: Hyperparameters for the strategies ---
+# These are passed to the salience worker config.
+STRATEGY_CONFIGS = {
+    "naive_cos_dissimilarity": {
+        "z_score_threshold": 0.85, # The threshold for the simple Z-score method. 
+    },
+    "pca_mahalanobis": {
+        "pca_n_components": 16,      # Max components (top-k guardrail).
+        "pca_variance_threshold": 0.95, # The variance to capture (top-p).
+        "novelty_z_score_threshold": 1.0 # Z-score threshold for the Mahalanobis scores themselves.
+    }
+}
+
 ### helper functions 
 
 
@@ -312,29 +331,37 @@ class Orchestrator:
 
     def process_salience_results(self, result: dict):
         """
-        Processes keyframe events from a salience worker and handles SHM cleanup.
+        Processes keyframe events and search logs from a salience worker.
         """
         shm_name = result['shm_name']
-        events = result.get('data', [])
-        
-        # ← Add this:
-        if not events:
-            print(f"Orchestrator: Deep analysis of {shm_name} found NO keyframes. Cleaning up.")
-        else:
-            print(f"Orchestrator: Received {len(events)} events from {shm_name}.")
-            
-            # --- Rule Application ---
-            # A more advanced version would aggregate events to create fewer, longer video clips
+        data = result.get('data', {})
+        keyframes = data.get('keyframes', [])
+        search_log = data.get('search_log', [])
+
+        print(f"Orchestrator: Received {len(keyframes)} keyframes and {len(search_log)} search log entries from {shm_name}.")
+
+        # --- NEW: Persist the search log for a detailed timeline ---
+        if search_log:
+            log_event = {
+                "event_id": str(uuid.uuid4()),
+                "stream_type": "SALIENCE_SEARCH_LOG",
+                "start_timestamp": result['timestamps'][0],
+                "delta_timestamp": result['timestamps'][-1] - result['timestamps'][0],
+                "payload_json": orjson.dumps({'shm_name': shm_name, 'log': search_log}).decode('utf-8')
+            }
+            self.persistence_manager.event_queue.put(log_event)
+
+        # --- Rule Application & Video Encoding (only if keyframes were found) ---
+        if keyframes:
             video_encode_jobs = []
-            for event in events:
-                if event.get('type') == 'VISUAL_KEYFRAME':
-                    video_encode_jobs.append({
-                        'start_time': event['timestamp'] - 2.0,
-                        'end_time': event['timestamp'] + 2.0,
-                        'quality': 'HIGH'
-                    })
+            for event in keyframes:
+                # This logic can be expanded to handle different kernel types
+                video_encode_jobs.append({
+                    'start_time': event['timestamp'] - 2.0,
+                    'end_time': event['timestamp'] + 2.0,
+                    'quality': 'HIGH'
+                })
             
-            # --- Dispatch Encoding Tasks ---
             if video_encode_jobs:
                 # We need to re-attach to the SHM to get frame data for the encoder
                 try:
@@ -391,7 +418,10 @@ class Orchestrator:
             p = Process(target=target, args=args, name=name, daemon=True)
             self.processes.append(p)
         for i in range(self.num_salience_workers):
-            p = Process(target=analysis_worker_loop, args=(self.salience_task_queue, self.salience_results_queue, 'SigLIPSalienceWorker', None, self.config['output_path'], self.shutdown_event), name=f"Salience-{i}", daemon=True)
+            # --- MODIFIED: The arguments are now simpler and more generic ---
+            p = Process(target=analysis_worker_loop, 
+                        args=(self.salience_task_queue, self.salience_results_queue, self.config, self.config['output_path'], self.shutdown_event), 
+                        name=f"Salience-{i}", daemon=True)
             self.processes.append(p)
         for i in range(self.num_encoding_workers):
             p = Process(target=video_encoding_worker_loop, args=(self.encoding_task_queue, self.encoding_results_queue, self.config['output_path']), name=f"Encoder-{i}", daemon=True)
@@ -670,6 +700,9 @@ if __name__ == "__main__":
         "chunk_seconds": CHUNK_SECONDS,
         "capture_fps": CAPTURE_FPS,
         "triage_threshold": TRIAGE_THRESHOLD,
+        "salience_kernels": SALIENCE_KERNELS, # <-- Add this line
+        "salience_strategy": SALIENCE_STRATEGY,
+        **STRATEGY_CONFIGS[SALIENCE_STRATEGY]
     }
 
     orchestrator = None
