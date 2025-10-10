@@ -4,6 +4,18 @@ This is a tool for recording gameplay sessions for machine vision and reinforcem
 
 **THIS IS A TOOL FOR KEYLOGGING YOUR PERSONAL VIDEOGAME-USE SESSIONS FOR MACHINE VISION RESEARCH. BE ETHICAL, HONEST, AND KIND WITH USER INTERACTION DATA.** 
 
+## INDEV:
+major missing features:
+
+- PCA decomposition
+- re-add ocr model saliency capture
+- rewrite to use obs-studio virtual camera API for various kinds of user data hygeine (avoid ever seeing emails or directories if user alt-tabs)
+- audio capture (lol)
+- reimplement low-level-of-detail low-bitrate 'baseline recording'
+- data viewer
+- rewrite to something like zeromq + trio so adding new features is less likely to crash your computer ;)
+- vc funding 
+
 ## Core Features
 
 -   **Salience-Based Recording**: Uses Vision Transformer models (SigLIP, DOTS) to detect significant visual and OCR events, saving high-quality footage and data only around these moments.

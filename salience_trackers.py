@@ -1,15 +1,11 @@
 # salience_trackers.py 
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 from sklearn.decomposition import IncrementalPCA
 from scipy.spatial.distance import mahalanobis
 from collections import deque
-
-# --- NEW: A factory dictionary to map config strings to classes ---
-TRACKER_STRATEGIES = {
-    "naive_cos_dissimilarity": NaiveZScoreTracker,
-    "pca_mahalanobis": PCAMahanalobisTracker,
-}
 
 # We still need OnlineStats for our trackers
 class OnlineStats:
@@ -41,6 +37,7 @@ class BaseSalienceTracker:
     """
     def __init__(self, config: dict):
         self.config = config
+        self.device = config['device']
 
     def update(self, latents_batch: np.ndarray):
         """Update the internal state of the tracker with a new batch of latents."""
@@ -57,93 +54,156 @@ class BaseSalienceTracker:
 
 class NaiveZScoreTracker(BaseSalienceTracker):
     """
-    The original strategy: uses cosine distance between sequential frames
-    and flags an event based on a simple Z-score.
+    A Torch-native implementation of the Z-score strategy.
+    All core calculations are done on the GPU.
     """
     def __init__(self, config: dict):
         super().__init__(config)
         self.distance_stats = OnlineStats()
         self.last_latent = None
 
-    def update(self, latents_batch: np.ndarray):
-        # We update the stats based on the distances within this batch
+    def _stable_cosine_distance(self, sequence: torch.Tensor) -> torch.Tensor:
+        """ Calculates cosine distance robustly on the specified device. """
+        # F.normalize is the numerically stable way to do this in PyTorch
+        normalized_sequence = F.normalize(sequence, p=2, dim=1)
+        
+        # Calculate similarity between adjacent vectors
+        similarity = torch.einsum('ij,ij->i', normalized_sequence[:-1], normalized_sequence[1:])
+        
+        # Clamp values to handle potential floating point inaccuracies
+        similarity = torch.clamp(similarity, -1.0, 1.0)
+        
+        return 1.0 - similarity
+
+    def update(self, latents_batch: torch.Tensor):
         if self.last_latent is None and len(latents_batch) > 0:
-            self.last_latent = latents_batch[0]
+            self.last_latent = latents_batch[0].unsqueeze(0)
         
         if len(latents_batch) > 1:
-            # Prepend the last latent from the previous batch to calculate the first distance
-            full_sequence = np.vstack([self.last_latent, latents_batch])
-            # Cosine similarity is 1 - distance
-            sim = np.einsum('ij,ij->i', full_sequence[:-1], full_sequence[1:]) / (np.linalg.norm(full_sequence[:-1], axis=1) * np.linalg.norm(full_sequence[1:], axis=1))
-            distances = 1 - sim
-            for dist in distances:
+            full_sequence = torch.cat([self.last_latent, latents_batch], dim=0)
+            distances = self._stable_cosine_distance(full_sequence)
+            
+            # --- MINIMAL CPU TRANSFER ---
+            # Only the final scalar distances are moved to the CPU to update the stats.
+            cpu_distances = distances.cpu().float().numpy()
+            for dist in cpu_distances:
                 self.distance_stats.update(dist)
         
         if len(latents_batch) > 0:
-            self.last_latent = latents_batch[-1]
+            self.last_latent = latents_batch[-1].unsqueeze(0)
 
-    def get_novelty_scores(self, latents_batch: np.ndarray) -> np.ndarray:
-        # The "score" is simply the cosine distance to the previous frame.
+    def get_novelty_scores(self, latents_batch: torch.Tensor) -> torch.Tensor:
         if self.last_latent is None or len(latents_batch) == 0:
-            return np.zeros(len(latents_batch))
+            return torch.zeros(len(latents_batch), device=self.device)
 
-        full_sequence = np.vstack([self.last_latent, latents_batch])
-        sim = np.einsum('ij,ij->i', full_sequence[:-1], full_sequence[1:]) / (np.linalg.norm(full_sequence[:-1], axis=1) * np.linalg.norm(full_sequence[1:], axis=1))
-        return 1 - sim
+        full_sequence = torch.cat([self.last_latent, latents_batch], dim=0)
+        return self._stable_cosine_distance(full_sequence)
     
-    def is_novel(self, scores: np.ndarray) -> np.ndarray:
+    def is_novel(self, scores: torch.Tensor) -> torch.Tensor:
         mean, std_dev = self.distance_stats.mean, self.distance_stats.std_dev
         if std_dev == 0:
-            return np.zeros_like(scores, dtype=bool)
+            return torch.zeros_like(scores, dtype=torch.bool)
         
         threshold = mean + (std_dev * self.config['z_score_threshold'])
         return scores > threshold
 
+
 class PCAMahanalobisTracker(BaseSalienceTracker):
     """
-    The advanced strategy: uses IncrementalPCA to model the latent space
-    and a dynamic Z-score on the Mahalanobis distance to detect novelty.
-    This is a CPU-based implementation.
+    A hybrid Torch/Sklearn implementation of the PCA Mahalanobis strategy.
+    - Model fitting (update) is done on the CPU using sklearn for robustness.
+    - Novelty scoring is done on the GPU using pure PyTorch for speed.
     """
     def __init__(self, config: dict):
         super().__init__(config)
-        self.latent_dim = 1024 # Assuming SigLIP base
+        # The PCA model itself lives on the CPU.
         self.pca = IncrementalPCA(n_components=self.config['pca_n_components'])
+        
+        # We will store Torch copies of the PCA parameters on the target device.
+        self.mean_ = None
+        self.components_ = None
+        self.explained_variance_ = None
+        
+        # The final novelty score statistics are still scalar and live on the CPU.
         self.novelty_score_stats = OnlineStats()
         self.n_samples_seen = 0
 
-    def update(self, latents_batch: np.ndarray):
-        self.pca.partial_fit(latents_batch)
-        self.n_samples_seen += len(latents_batch)
+        # --- NEW: An internal buffer to accumulate latents before fitting ---
+        self.latent_buffer = []
+        # We'll fit the model when the buffer reaches a reasonable size, e.g., twice the number of components.
+        self.fit_batch_size = self.config['pca_n_components'] * 2
 
-    def get_novelty_scores(self, latents_batch: np.ndarray) -> np.ndarray:
-        if self.n_samples_seen <= self.config['pca_n_components']:
-            return np.zeros(len(latents_batch))
+    def update(self, latents_batch: torch.Tensor):
+        """
+        Accumulates new latents and periodically updates the PCA model
+        once enough new samples have been collected.
+        """
+        # --- MODIFIED: The update logic is now buffered ---
 
-        # Determine dynamic number of components to use based on variance threshold
-        cumulative_variance = np.cumsum(self.pca.explained_variance_ratio_)
-        k_dynamic = np.searchsorted(cumulative_variance, self.config['pca_variance_threshold']) + 1
+        # 1. Add new latents to our internal buffer.
+        #    This is an infrequent operation, so the CPU transfer is acceptable.
+        self.latent_buffer.extend(latents_batch.cpu().float().numpy())
         
-        # Get the required components for the calculation
-        mean = self.pca.mean_
-        components = self.pca.components_[:k_dynamic]
-        variance = self.pca.explained_variance_[:k_dynamic]
+        # 2. Check if we have enough samples to perform a meaningful fit.
+        if len(self.latent_buffer) >= self.fit_batch_size:
+            # We have enough data, so perform the fit.
+            fit_data = np.array(self.latent_buffer)
+            self.pca.partial_fit(fit_data)
+            self.n_samples_seen += len(fit_data)
 
-        # Project, calculate squared Mahalanobis distance, and take sqrt
-        transformed = (latents_batch - mean) @ components.T
-        sq_mahalanobis = np.sum((transformed ** 2) / variance, axis=1)
+            # Clear the buffer now that the data has been incorporated into the model.
+            self.latent_buffer = []
+
+            # After fitting, transfer the small model parameters back to the GPU.
+            self.mean_ = torch.from_numpy(self.pca.mean_).to(self.device, dtype=torch.float32)
+            self.components_ = torch.from_numpy(self.pca.components_).to(self.device, dtype=torch.float32)
+            self.explained_variance_ = torch.from_numpy(self.pca.explained_variance_).to(self.device, dtype=torch.float32)
+
+    def get_novelty_scores(self, latents_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the Mahalanobis distance for a batch of latents
+        entirely on the GPU using the cached PCA parameters.
+        """
+        # If the model hasn't been fitted yet, there's no novelty.
+        if self.mean_ is None or self.n_samples_seen <= self.config['pca_n_components']:
+            return torch.zeros(len(latents_batch), device=self.device)
+
+        # Use p% variance threshold to find the dynamic number of components to use.
+        cumulative_variance = torch.cumsum(self.explained_variance_ / torch.sum(self.explained_variance_), dim=0)
+        k_dynamic = torch.searchsorted(cumulative_variance, self.config['pca_variance_threshold']).item() + 1
         
-        return np.sqrt(sq_mahalanobis)
+        # Slice the components and variance to the dynamic size for denoising.
+        components = self.components_[:k_dynamic]
+        variance = self.explained_variance_[:k_dynamic]
 
-    def is_novel(self, scores: np.ndarray) -> np.ndarray:
-        # Update our running stats on what a "normal" score is
-        for score in scores:
-            self.novelty_score_stats.update(score)
+        # --- All of the following operations are pure PyTorch on the GPU ---
+        
+        # Project the centered data onto the principal components.
+        transformed = (latents_batch - self.mean_) @ components.T
+        
+        # Calculate the squared Mahalanobis distance. Add epsilon for numerical stability.
+        epsilon = 1e-8
+        sq_mahalanobis = torch.sum((transformed ** 2) / (variance + epsilon), dim=1)
+        
+        return torch.sqrt(sq_mahalanobis)
+
+    def is_novel(self, scores: torch.Tensor) -> torch.Tensor:
+        # Transfer the final scalar scores to the CPU to update the OnlineStats.
+        # This is a minimal data transfer.
+        cpu_scores = scores.detach().cpu().float().numpy()
+        for score in cpu_scores:
+            if not np.isnan(score):
+                self.novelty_score_stats.update(score)
             
         mean, std_dev = self.novelty_score_stats.mean, self.novelty_score_stats.std_dev
         if std_dev == 0:
-            return np.zeros_like(scores, dtype=bool)
+            return torch.zeros_like(scores, dtype=torch.bool)
 
-        # A score is novel if it's an outlier compared to *other recent scores*
         threshold = mean + (std_dev * self.config['novelty_z_score_threshold'])
         return scores > threshold
+
+# --- NEW: A factory dictionary to map config strings to classes ---
+TRACKER_STRATEGIES = {
+    "naive_cos_dissimilarity": NaiveZScoreTracker,
+    "pca_mahalanobis": PCAMahanalobisTracker,
+}

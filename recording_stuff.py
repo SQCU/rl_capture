@@ -20,14 +20,14 @@ from PIL import Image
 from collections import deque
 
 # We now need one of the salience workers in the Triage process itself
-from salience_workers import analysis_worker_loop, SigLIPSalienceWorker, _downscale_image 
+import salience_workers as sal_wo
 from window_utils import get_window_finder, WindowNotFoundError
 
 # --- Configuration ---
 RECORDING_WINDOW_NAME = "ToramOnline"
 CAPTURE_REGION = None
 OUTPUT_PATH = f"./capture_run_{int(time.time())}"
-CHUNK_SECONDS = 10  # How many seconds of frames to triage at a time
+CHUNK_SECONDS = 5  # How many seconds of frames to triage at a time
 CAPTURE_FPS = 30
 # --- NEW: Triage Configuration ---
 TRIAGE_THRESHOLD = 0.1 # A starting point for max_delta to trigger deep analysis
@@ -35,19 +35,23 @@ TRIAGE_THRESHOLD = 0.1 # A starting point for max_delta to trigger deep analysis
 # --- NEW: Salience Strategy Configuration ---
 # Choose which algorithm to use for novelty detection.
 # Options: "naive_cos_dissimilarity", "pca_mahalanobis"
-SALIENCE_STRATEGY = "naive_cos_dissimilarity"
+SALIENCE_STRATEGY = "pca_mahalanobis" 
 SALIENCE_KERNELS = ["siglip"] # Add "ocr" to this list to enable the OCR kernel
 
 # --- NEW: Hyperparameters for the strategies ---
 # These are passed to the salience worker config.
 STRATEGY_CONFIGS = {
     "naive_cos_dissimilarity": {
-        "z_score_threshold": 0.85, # The threshold for the simple Z-score method. 
+        "z_score_threshold": 0.5, # The threshold for the simple Z-score method.
+        "branching_factor": 8, # Override the worker's default of 8
+        "min_exhaustive_size": 16, # Override the worker's default of 16 
     },
     "pca_mahalanobis": {
         "pca_n_components": 16,      # Max components (top-k guardrail).
         "pca_variance_threshold": 0.95, # The variance to capture (top-p).
-        "novelty_z_score_threshold": 1.0 # Z-score threshold for the Mahalanobis scores themselves.
+        "novelty_z_score_threshold": 1.0, # Z-score threshold for the Mahalanobis scores themselves.
+        "branching_factor": 8, # Override the worker's default of 8
+        "min_exhaustive_size": 16, # Override the worker's default of 16
     }
 }
 
@@ -181,78 +185,85 @@ def capture_process_loop(raw_frame_queue: Queue, config: dict, shutdown_event: E
                 
     print(f"[{os.getpid()}] Capture process finished.")
 
+def _stage_and_dispatch_chunk(frames: list, timestamps: list, salience_task_queue: Queue, shm_notification_queue: Queue):
+    """
+    Handles the creation of a shared memory block, copying frame data into it,
+    and dispatching the necessary tasks to the salience workers and orchestrator.
+    """
+    try:
+        # 1. Prepare SHM block parameters
+        buffer_shape = (len(frames), *frames[0].shape)
+        buffer_size = int(np.prod(buffer_shape) * np.dtype(np.uint8).itemsize)
+        shm_name = f"salience_chunk_{uuid.uuid4()}"
 
-def triage_dispatcher_loop(raw_frame_queue: Queue, salience_task_queue: Queue, shm_notification_queue: Queue, config: dict, shutdown_event: Event):
+        # 2. Create the block and copy data
+        shm = shared_memory.SharedMemory(name=shm_name, create=True, size=buffer_size)
+        shm_buffer = np.ndarray(buffer_shape, dtype=np.uint8, buffer=shm.buf)
+        np.copyto(shm_buffer, np.array(frames))
+
+        # 3. Create the task for the salience workers
+        task = {
+            "shm_name": shm_name,
+            "shape": buffer_shape,
+            "dtype": np.uint8,
+            "timestamps": list(timestamps)
+        }
+        
+        # 4. Dispatch tasks to the respective queues
+        salience_task_queue.put(task)
+        shm_notification_queue.put(shm_name)
+
+        # 5. Close our local handle. The Orchestrator now owns the block.
+        shm.close()
+
+    except Exception as e:
+        print(f"[Dispatcher] CRITICAL ERROR during chunk dispatch: {e}")
+        # Attempt to clean up a partially created SHM block if something went wrong
+        if 'shm' in locals() and shm:
+            shm.close()
+            try:
+                shm.unlink() # This might fail if it was never fully created, that's okay.
+            except FileNotFoundError:
+                pass
+
+
+def dispatcher_loop(raw_frame_queue: Queue, salience_task_queue: Queue, shm_notification_queue: Queue, config: dict, shutdown_event: Event):
     """
-    The Brain: Performs cheap, coarse-grained analysis to decide if a chunk of time
-    is "boring" or "interesting" enough to be promoted for deep analysis.
+    The Dispatcher: A "dumb" process that only buffers frames, stages them
+    to shared memory, and puts a generic analysis task on the queue.
+    It performs ZERO analysis itself.
     """
-    print(f"[{os.getpid()}] Triage Dispatcher started.")
-    
-    # This process needs its own lightweight model for the triage step
-    # We use SigLIP as it's generally faster.
-    triage_worker = SigLIPSalienceWorker(config=None, output_path=config['output_path'])
-    
+    worker_pid = os.getpid()
+    print(f"[{worker_pid}] Dispatcher started.")
+
     frames_per_chunk = int(config['chunk_seconds'] * config['capture_fps'])
     frame_buffer = deque(maxlen=frames_per_chunk)
 
     while not shutdown_event.is_set():
         try:
-            # Block for a short time to avoid busy-waiting, but remain responsive
             timestamp, frame = raw_frame_queue.get(timeout=0.1)
             frame_buffer.append((timestamp, frame))
 
+            # --- MODIFIED: The logic is now radically simpler ---
             if len(frame_buffer) == frames_per_chunk:
-                print(f"[{os.getpid()}] Triage: Analyzing {len(frame_buffer)}-frame chunk...")
+                print(f"[{worker_pid}] Dispatcher: Staging {len(frame_buffer)}-frame chunk for analysis.")
                 
-                # --- The Flops-Optimistic Pre-Analysis ---
                 timestamps, frames = zip(*frame_buffer)
-                sentinel_indices = np.linspace(0, len(frames) - 1, 8, dtype=int)
-                sentinel_frames = [_downscale_image(Image.fromarray(frames[i])) for i in sentinel_indices]
                 
-                with torch.no_grad():
-                    latents = triage_worker._inference(sentinel_frames)
-                    distances = (1 - F.cosine_similarity(latents[:-1], latents[1:], dim=1)).cpu().float().numpy()
+                # The dispatcher's ONLY job is to stage the data and create a generic task.
+                _stage_and_dispatch_chunk(
+                    frames=list(frames), 
+                    timestamps=list(timestamps), 
+                    salience_task_queue=salience_task_queue, 
+                    shm_notification_queue=shm_notification_queue
+                )
                 
-                max_delta = np.max(distances) if len(distances) > 0 else 0
-                
-                # --- The Triage Decision ---
-                if max_delta >= config['triage_threshold']:
-                    print(f"[{os.getpid()}] Triage: INTERESTING chunk found (max_delta={max_delta:.4f}). Staging for deep analysis.")
-                    
-                    # 1. Create a new, dedicated Shared Memory block
-                    buffer_shape = (len(frames), *frames[0].shape)
-                    buffer_size = int(np.prod(buffer_shape) * np.dtype(np.uint8).itemsize)
-                    shm_name = f"salience_chunk_{uuid.uuid4()}"
-                    shm = shared_memory.SharedMemory(name=shm_name, create=True, size=buffer_size)
-                    
-                    # 2. Copy the frame data into the new SHM block
-                    shm_buffer = np.ndarray(buffer_shape, dtype=np.uint8, buffer=shm.buf)
-                    np.copyto(shm_buffer, np.array(frames))
-
-                    # 3. Dispatch the task to the salience workers
-                    task = {
-                        "shm_name": shm_name,
-                        "shape": buffer_shape,
-                        "dtype": np.uint8,
-                        "timestamps": list(timestamps)
-                    }
-                    salience_task_queue.put(task)
-
-                    # --- NEW: Notify the Orchestrator to claim this block ---
-                    shm_notification_queue.put(shm_name)
-                    
-                    shm.close() # The Orchestrator will be responsible for keeping the block alive.
-                else:
-                    print(f"[{os.getpid()}] Triage: Boring chunk (max_delta={max_delta:.4f}). Discarding.")
-                
-                # We processed a full chunk, clear the buffer to start fresh
                 frame_buffer.clear()
 
         except queue.Empty:
-            continue # This is normal, just loop again
+            continue
 
-    print(f"[{os.getpid()}] Triage Dispatcher finished.")
+    print(f"[{worker_pid}] Dispatcher finished.")
 
 class Orchestrator:
     """
@@ -353,16 +364,37 @@ class Orchestrator:
 
         # --- Rule Application & Video Encoding (only if keyframes were found) ---
         if keyframes:
-            video_encode_jobs = []
+            # --- FIX: Aggregate and merge overlapping time intervals ---
+            intervals = []
             for event in keyframes:
-                # This logic can be expanded to handle different kernel types
+                intervals.append([event['timestamp'] - 2.0, event['timestamp'] + 2.0])
+            
+            # Sort intervals by start time
+            intervals.sort(key=lambda x: x[0])
+            
+            merged_intervals = []
+            if intervals:
+                current_merge = intervals[0]
+                for next_interval in intervals[1:]:
+                    # If the next interval overlaps with the current one, merge them
+                    if next_interval[0] <= current_merge[1]:
+                        current_merge[1] = max(current_merge[1], next_interval[1])
+                    else:
+                        # Otherwise, the current merge is finished. Start a new one.
+                        merged_intervals.append(current_merge)
+                        current_merge = next_interval
+                merged_intervals.append(current_merge)
+
+            video_encode_jobs = []
+            for start_time, end_time in merged_intervals:
                 video_encode_jobs.append({
-                    'start_time': event['timestamp'] - 2.0,
-                    'end_time': event['timestamp'] + 2.0,
+                    'start_time': start_time,
+                    'end_time': end_time,
                     'quality': 'HIGH'
                 })
             
             if video_encode_jobs:
+                print(f"Orchestrator: Merged {len(keyframes)} events into {len(video_encode_jobs)} encoding job(s).")
                 # We need to re-attach to the SHM to get frame data for the encoder
                 try:
                     shm = shared_memory.SharedMemory(name=shm_name)
@@ -412,14 +444,14 @@ class Orchestrator:
         # --- Start Processes ---
         process_map = {
             "Capture": (capture_process_loop, (self.raw_frame_queue, self.config, self.shutdown_event)),
-            "Triage": (triage_dispatcher_loop, (self.raw_frame_queue, self.salience_task_queue, self.shm_notification_queue, self.config, self.shutdown_event)),
+            "Triage": (dispatcher_loop, (self.raw_frame_queue, self.salience_task_queue, self.shm_notification_queue, self.config, self.shutdown_event)),
         }
         for name, (target, args) in process_map.items():
             p = Process(target=target, args=args, name=name, daemon=True)
             self.processes.append(p)
         for i in range(self.num_salience_workers):
             # --- MODIFIED: The arguments are now simpler and more generic ---
-            p = Process(target=analysis_worker_loop, 
+            p = Process(target=sal_wo.analysis_worker_loop, 
                         args=(self.salience_task_queue, self.salience_results_queue, self.config, self.config['output_path'], self.shutdown_event), 
                         name=f"Salience-{i}", daemon=True)
             self.processes.append(p)

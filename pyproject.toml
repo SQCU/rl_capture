@@ -35,7 +35,8 @@ dependencies = [
     "bitsandbytes", # For model quantization (e.g., 8-bit loading)
     "protobuf",
     "pywin32",
-    'accelerate>=0.26.0'
+    'accelerate>=0.26.0',
+    'scikit-learn'
 ]
 
 [project.urls]

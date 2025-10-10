@@ -40,9 +40,9 @@ class SalienceKernel:
     Abstract Base Class for a self-contained "expert" on one type of salience.
     It bundles a model with its own private statistical tracker.
     """
-    def __init__(self, config: dict, device):
+    def __init__(self, config: dict):
         self.kernel_name = "BaseKernel"
-        self.device = device
+        self.device = config['device']
         self.config = config
         
         # Each kernel gets its own, independent statistical tracker.
@@ -64,8 +64,8 @@ class SalienceKernel:
 
 class SigLIPKernel(SalienceKernel):
     """The expert on whole-image visual semantics."""
-    def __init__(self, config: dict, device):
-        super().__init__(config, device)
+    def __init__(self, config: dict):
+        super().__init__(config)
         self.kernel_name = "VISUAL_SEMANTIC"
         
         model_path = "./models/siglip"
@@ -83,8 +83,8 @@ class SigLIPKernel(SalienceKernel):
 
 class OCRLatentKernel(SalienceKernel):
     """The expert on typographic change and drift."""
-    def __init__(self, config: dict, device):
-        super().__init__(config, device)
+    def __init__(self, config: dict):
+        super().__init__(config)
         self.kernel_name = "OCR_LATENT"
         
         model_path = "./models/dots_ocr"
@@ -116,6 +116,24 @@ class HierarchicalSearchManager:
         self.worker_id = f"SearchManager_{os.getpid()}"
         self.latent_cache = {}
 
+        # --- NEW: Restore the robust default configuration pattern ---
+        # 1. Start with a baseline of hard-coded, sensible defaults.
+        self.config = self._get_default_search_config()
+        # 2. Merge the externally provided config on top of the defaults.
+        if config:
+            self.config.update(config)
+
+    def _get_default_search_config(self) -> dict:
+        """
+        Provides a centralized, fallback configuration for the search process.
+        """
+        print(f"[{self.worker_id}] Loading default search configuration.")
+        return {
+            "branching_factor": 8,       # How many sentinel frames to check per chunk
+            "min_exhaustive_size": 16,   # Chunks smaller than this are always processed fully
+            "max_batch_size": 16,        # A safe default for most modern GPUs
+        }
+
     @torch.no_grad()
     def _get_latents_for_indices(self, frames_chunk: list, indices: list[int]) -> dict[str, torch.Tensor]:
         indices_to_compute = [i for i in indices if any((k.kernel_name, i) not in self.latent_cache for k in self.kernels)]
@@ -143,57 +161,94 @@ class HierarchicalSearchManager:
         span_indices = list(range(start_idx, end_idx + 1))
         if len(span_indices) < 2: return []
         
-        all_latents = self._get_latents_for_indices(frames_chunk, span_indices)
+        all_latents_by_kernel = self._get_latents_for_indices(frames_chunk, span_indices)
         all_keyframes = []
 
         search_log.append({'type': 'exhaustive_scan', 'span': (timestamps_chunk[start_idx], timestamps_chunk[end_idx]), 'num_frames': len(span_indices)})
 
         for kernel in self.kernels:
-            latents_np = all_latents[kernel.kernel_name].cpu().numpy()
-            scores = kernel.tracker.get_novelty_scores(latents_np)
+            # The latents stay on the GPU as a torch.Tensor
+            latents_tensor = all_latents_by_kernel[kernel.kernel_name]
+
+            # --- SIMPLIFIED: No more type checking needed! ---
+            # Both trackers now accept a GPU tensor. The PCA tracker handles its
+            # own CPU transfers internally during its `update` step.
+            scores = kernel.tracker.get_novelty_scores(latents_tensor)
             is_novel_mask = kernel.tracker.is_novel(scores)
             
-            novel_indices = np.where(is_novel_mask)[0]
+            novel_indices = torch.where(is_novel_mask)[0]
+
+            # Minimal CPU transfer for logging the final results
+            cpu_scores = scores.detach().cpu().float().numpy()
             for i in novel_indices:
-                event_index = start_idx + i
-                event = kernel.create_keyframe_event(timestamps_chunk[event_index], float(scores[i]), "exhaustive_scan_spike")
+                event_index = start_idx + i.item()
+                event = kernel.create_keyframe_event(timestamps_chunk[event_index], float(cpu_scores[i]), "exhaustive_scan_spike")
                 all_keyframes.append(event)
             
-            kernel.tracker.update(latents_np)
+            # The update call is now clean and polymorphic
+            kernel.tracker.update(latents_tensor)
             
         return all_keyframes
 
     def _recursive_search_step(self, frames_chunk: list, search_queue: deque, start_idx: int, end_idx: int, depth: int, search_log: list):
-        sentinel_indices = np.linspace(start_idx, end_idx, self.config.get('branching_factor', 8), dtype=int)
-        all_latents = self._get_latents_for_indices(frames_chunk, sentinel_indices.tolist())
+        """
+        Performs the recursive, coarse-grained search step entirely on the GPU.
+        """
+        sentinel_indices = np.linspace(start_idx, end_idx, self.config['branching_factor'], dtype=int)
+        all_latents_by_kernel = self._get_latents_for_indices(frames_chunk, sentinel_indices.tolist())
 
         found_hotspot = False
-        max_score_info = {'score': -1, 'span': None, 'reason': None}
+        max_score_info = {'score': -1.0, 'span': None, 'reason': None}
 
         for i in range(len(sentinel_indices) - 1):
             sub_span_start, sub_span_end = int(sentinel_indices[i]), int(sentinel_indices[i+1])
             is_interesting_span = False
+            
+            # This variable will hold the score of the most interesting kernel for this span
+            span_top_score = -1.0
 
             for kernel in self.kernels:
-                latents_np = all_latents[kernel.kernel_name][[i, i+1]].cpu().numpy()
-                score = kernel.tracker.get_novelty_scores(latents_np)[0]
+                # --- MODIFIED: All operations are now on GPU Tensors ---
                 
-                if kernel.tracker.is_novel(np.array([score]))[0]:
+                # 1. Slice the two relevant sentinel latents. This remains a GPU tensor.
+                latents_tensor_slice = all_latents_by_kernel[kernel.kernel_name][[i, i+1]]
+                
+                # 2. Get the novelty score. The tracker returns a single-element GPU tensor.
+                score_tensor = kernel.tracker.get_novelty_scores(latents_tensor_slice)[0]
+                
+                # 3. Ask the tracker if this score is novel.
+                # We unsqueeze to create a "batch" of 1 for the tracker.
+                is_novel_flag = kernel.tracker.is_novel(score_tensor.unsqueeze(0))[0]
+
+                # 4. Use .item() to get the Python boolean for control flow. No large data transfer.
+                if is_novel_flag.item():
                     is_interesting_span = True
-                    search_log.append({'type': 'recursive_descent', 'span_indices': (sub_span_start, sub_span_end), 'reason': f'{kernel.kernel_name}_spike', 'score': float(score)})
-                    break # One kernel is enough to flag the span
+                    search_log.append({
+                        'type': 'recursive_descent', 
+                        'span_indices': (sub_span_start, sub_span_end), 
+                        'reason': f'{kernel.kernel_name}_spike', 
+                        'score': score_tensor.item() # Use .item() for logging
+                    })
+                    break # One kernel is enough to flag the span as interesting.
             
             if is_interesting_span:
                 search_queue.append((sub_span_start, sub_span_end, depth + 1))
                 found_hotspot = True
             
-            # Keep track of the most different span, regardless of statistical novelty
-            if score > max_score_info['score']:
-                max_score_info.update({'score': score, 'span': (sub_span_start, sub_span_end), 'reason': f'{kernel.kernel_name}_max_score'})
+            # --- MODIFIED: Also use .item() for the max score comparison ---
+            # Get the scalar value of the last computed score
+            current_score_value = score_tensor.item()
+            if current_score_value > max_score_info['score']:
+                max_score_info.update({
+                    'score': current_score_value, 
+                    'span': (sub_span_start, sub_span_end), 
+                    'reason': f'{kernel.kernel_name}_max_score'
+                })
 
+        # If no statistically significant spike was found, descend into the most different sub-span.
         if not found_hotspot and max_score_info['span'] is not None:
             search_queue.append((*max_score_info['span'], depth + 1))
-            search_log.append({'type': 'recursive_descent_optimistic', 'span_indices': max_score_info['span'], **max_score_info})
+            search_log.append({'type': 'recursive_descent_optimistic', **max_score_info})
 
     def process_chunk(self, frames_chunk: list, timestamps_chunk: list, shutdown_event: Event) -> dict:
         self.latent_cache = {}
@@ -213,8 +268,24 @@ class HierarchicalSearchManager:
                     pbar.update(end_idx - start_idx + 1)
                 else:
                     self._recursive_search_step(frames_chunk, search_queue, start_idx, end_idx, depth, search_log)
+                    pbar.update(self.config['branching_factor'])
         
         return {'keyframes': final_events, 'search_log': search_log}
+
+
+# =====================================================================================
+#  NEW: The Kernel Factory (Registry)
+# =====================================================================================
+
+
+# This dictionary maps the string names used in the config to the actual kernel classes.
+# This is the single point of truth for what kernels are available.
+
+KERNEL_REGISTRY = {
+    "siglip": SigLIPKernel,
+    "ocr": OCRLatentKernel,
+}
+
 
 # =====================================================================================
 #  The Main Worker Loop (Now much simpler)
@@ -224,15 +295,16 @@ def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown
     worker_pid = os.getpid()
     print(f"[{worker_pid}] Analysis worker started.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config['device']=device
 
     # --- Instantiate all enabled kernels based on config ---
     kernels_to_load = config.get("salience_kernels", ["siglip"])
     kernels = []
     print(f"[{worker_pid}] Loading kernels: {kernels_to_load}")
     if "siglip" in kernels_to_load:
-        kernels.append(SigLIPKernel(config, device))
+        kernels.append(SigLIPKernel(config))
     if "ocr" in kernels_to_load:
-        kernels.append(OCRLatentKernel(config, device))
+        kernels.append(OCRLatentKernel(config))
     
     search_manager = HierarchicalSearchManager(kernels, config)
 
@@ -265,3 +337,4 @@ def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown
             import traceback; traceback.print_exc()
             
     print(f"[{worker_pid}] Analysis worker finished.")
+
