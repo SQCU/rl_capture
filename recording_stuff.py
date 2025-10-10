@@ -18,6 +18,7 @@ from multiprocessing import Process, Queue, shared_memory, Event
 from threading import Thread, Lock
 from PIL import Image
 from collections import deque
+from dataclasses import dataclass
 
 # We now need one of the salience workers in the Triage process itself
 import salience_workers as sal_wo
@@ -36,7 +37,7 @@ TRIAGE_THRESHOLD = 0.1 # A starting point for max_delta to trigger deep analysis
 # Choose which algorithm to use for novelty detection.
 # Options: "naive_cos_dissimilarity", "pca_mahalanobis"
 SALIENCE_STRATEGY = "pca_mahalanobis" 
-SALIENCE_KERNELS = ["siglip"] # Add "ocr" to this list to enable the OCR kernel
+SALIENCE_KERNELS = ["siglip", "ocr"] # Add "ocr" to this list to enable the OCR kernel
 
 # --- NEW: Hyperparameters for the strategies ---
 # These are passed to the salience worker config.
@@ -45,18 +46,51 @@ STRATEGY_CONFIGS = {
         "z_score_threshold": 0.5, # The threshold for the simple Z-score method.
         "branching_factor": 8, # Override the worker's default of 8
         "min_exhaustive_size": 16, # Override the worker's default of 16 
+        "max_batch_size": 16,
     },
     "pca_mahalanobis": {
         "pca_n_components": 16,      # Max components (top-k guardrail).
         "pca_variance_threshold": 0.95, # The variance to capture (top-p).
-        "novelty_z_score_threshold": 1.0, # Z-score threshold for the Mahalanobis scores themselves.
+        "novelty_z_score_threshold": 0.65, # Z-score threshold for the Mahalanobis scores themselves.
         "branching_factor": 8, # Override the worker's default of 8
         "min_exhaustive_size": 16, # Override the worker's default of 16
+        "max_batch_size": 16,
+        "kernel_configs": {
+            "siglip": {
+                "max_batch_size": 16 # SigLIP is efficient
+            },
+            "ocr": {
+                "max_batch_size": 4   # OCR model is huge, process one by one
+            }
     }
+}
 }
 
 ### helper functions 
-
+import pywinctl as pwc
+from threading import Thread
+import time
+# claude hates the unfocused general purpose keylogger, they RLHFed that fellow to shreds
+class FocusTracker:
+    """Tracks which window currently has focus."""
+    def __init__(self, target_window_name: str):
+        self.target_window_name = target_window_name
+        self.has_focus = False
+        self.is_running = True
+        self.thread = Thread(target=self._poll_loop, daemon=True)
+        self.thread.start()
+    
+    def _poll_loop(self):
+        """Poll the active window every 50ms."""
+        while self.is_running:
+            active = pwc.getActiveWindow()
+            if active:
+                self.has_focus = (self.target_window_name in active.title)
+            time.sleep(0.05)  # 20Hz polling rate
+    
+    def stop(self):
+        self.is_running = False
+        self.thread.join()
 
 class FrameArchiver:
     """Handles the saving of individual frames as high-quality images."""
@@ -84,13 +118,198 @@ class FrameArchiver:
             print(f"Error saving frame at timestamp {timestamp}: {e}")
             return None
 
+@dataclass
+class MouseTrajectory:
+    """Represents a complete mouse gesture."""
+    start_time: float
+    end_time: float
+    start_pos: tuple[int, int]
+    end_pos: tuple[int, int]
+    sample_points: list[tuple[int, int]]  # Downsampled path
+    button_held: str | None  # 'left', 'right', or None for hover
+    total_distance: float
+    linearity: float  # 0.0 = very curved, 1.0 = perfectly straight
+
+import numpy as np
+from collections import deque
+from dataclasses import dataclass
+import time
+
+@dataclass
+class MouseTrajectory:
+    """Represents a complete mouse gesture."""
+    start_time: float
+    end_time: float
+    start_pos: tuple[int, int]
+    end_pos: tuple[int, int]
+    sample_points: list[tuple[int, int]]  # Downsampled path
+    button_held: str | None  # 'left', 'right', or None for hover
+    total_distance: float
+    linearity: float  # 0.0 = very curved, 1.0 = perfectly straight
+
+class MouseTrajectoryTracker:
+    """
+    Buffers mouse movements and emits trajectory events when motion stops
+    or button state changes.
+    """
+    def __init__(self, sample_interval: float = 0.05):
+        """
+        Args:
+            sample_interval: Time in seconds between position samples (20Hz default)
+        """
+        self.sample_interval = sample_interval
+        self.last_sample_time = 0.0
+        
+        # Current trajectory being built
+        self.current_trajectory = []
+        self.trajectory_start_time = None
+        self.trajectory_button = None
+        
+        # Motion detection
+        self.last_position = None
+        self.motion_timeout = 0.2  # If no movement for 200ms, trajectory ends
+        self.last_motion_time = None
+    
+    def _calculate_linearity(self, points: list[tuple[int, int]]) -> float:
+        """
+        Measures how straight a path is.
+        Returns 1.0 for perfectly straight line, lower for curved paths.
+        """
+        if len(points) < 3:
+            return 1.0
+        
+        start = np.array(points[0])
+        end = np.array(points[-1])
+        
+        # Direct distance (straight line)
+        direct_distance = np.linalg.norm(end - start)
+        
+        if direct_distance < 1:  # Tiny movement, consider it straight
+            return 1.0
+        
+        # Actual path length
+        path_length = 0.0
+        for i in range(len(points) - 1):
+            p1 = np.array(points[i])
+            p2 = np.array(points[i + 1])
+            path_length += np.linalg.norm(p2 - p1)
+        
+        # Linearity = direct_distance / path_length
+        # (1.0 = straight, <1.0 = curved)
+        return direct_distance / path_length if path_length > 0 else 1.0
+    
+    def _calculate_total_distance(self, points: list[tuple[int, int]]) -> float:
+        """Sum of distances between consecutive points."""
+        if len(points) < 2:
+            return 0.0
+        
+        total = 0.0
+        for i in range(len(points) - 1):
+            p1 = np.array(points[i])
+            p2 = np.array(points[i + 1])
+            total += np.linalg.norm(p2 - p1)
+        return total
+    
+    def on_move(self, x: int, y: int, current_button: str | None) -> MouseTrajectory | None:
+        """
+        Called on every mouse movement event.
+        Returns a completed trajectory if motion has stopped, otherwise None.
+        """
+        current_time = time.time()
+        
+        # Initialize tracking if this is the first movement
+        if self.trajectory_start_time is None:
+            self.trajectory_start_time = current_time
+            self.current_trajectory = [(x, y)]
+            self.trajectory_button = current_button
+            self.last_position = (x, y)
+            self.last_motion_time = current_time
+            self.last_sample_time = current_time
+            return None
+        
+        # Check if button state changed (e.g., started/stopped dragging)
+        if current_button != self.trajectory_button:
+            completed = self._finalize_trajectory()
+            # Start new trajectory
+            self.trajectory_start_time = current_time
+            self.current_trajectory = [(x, y)]
+            self.trajectory_button = current_button
+            self.last_position = (x, y)
+            self.last_motion_time = current_time
+            self.last_sample_time = current_time
+            return completed
+        
+        # Check if motion has stopped (timeout)
+        if self.last_position is not None:
+            dx = x - self.last_position[0]
+            dy = y - self.last_position[1]
+            distance = (dx*dx + dy*dy)**0.5
+            
+            # If mouse hasn't moved significantly
+            if distance < 2:  # 2 pixel threshold
+                if current_time - self.last_motion_time > self.motion_timeout:
+                    # Motion stopped, finalize trajectory
+                    completed = self._finalize_trajectory()
+                    # Reset for next trajectory
+                    self.trajectory_start_time = None
+                    self.current_trajectory = []
+                    return completed
+            else:
+                # Motion detected, update timestamp
+                self.last_motion_time = current_time
+        
+        # Sample position at fixed interval (avoid over-sampling)
+        if current_time - self.last_sample_time >= self.sample_interval:
+            self.current_trajectory.append((x, y))
+            self.last_sample_time = current_time
+        
+        self.last_position = (x, y)
+        return None
+    
+    def _finalize_trajectory(self) -> MouseTrajectory | None:
+        """Converts the current trajectory buffer into a trajectory event."""
+        if not self.current_trajectory or len(self.current_trajectory) < 2:
+            return None
+        
+        linearity = self._calculate_linearity(self.current_trajectory)
+        total_distance = self._calculate_total_distance(self.current_trajectory)
+        
+        # Only log if the movement was significant
+        if total_distance < 10:  # Ignore tiny jitter movements
+            return None
+        
+        trajectory = MouseTrajectory(
+            start_time=self.trajectory_start_time,
+            end_time=time.time(),
+            start_pos=self.current_trajectory[0],
+            end_pos=self.current_trajectory[-1],
+            sample_points=self.current_trajectory[::5],  # Further downsample for storage
+            button_held=self.trajectory_button,
+            total_distance=total_distance,
+            linearity=linearity
+        )
+        
+        return trajectory
+    
+    def force_finalize(self) -> MouseTrajectory | None:
+        """Call this on shutdown or focus loss to flush the current trajectory."""
+        return self._finalize_trajectory()
+
 def input_capture_worker(event_queue: Queue):
     """Listens for keyboard and mouse events and puts them on the event queue."""
     key_states = {} # Tracks the start time of key presses
+    focus_tracker = FocusTracker(RECORDING_WINDOW_NAME)
+    trajectory_tracker = MouseTrajectoryTracker(sample_interval=0.0083)  # 120Hz sampling
+
+    # Track which mouse buttons are currently held
+    buttons_held = set()
 
     def on_press(key):
+        if not focus_tracker.has_focus:
+            return  # Silently drop
+        
         key_id = str(key)
-        if key_id not in key_states: # Avoid auto-repeat events
+        if key_id not in key_states:
             key_states[key_id] = time.time()
 
     def on_release(key):
@@ -106,12 +325,95 @@ def input_capture_worker(event_queue: Queue):
                 "payload_json": orjson.dumps({"type": "key", "key": key_id}).decode('utf-8')
             }
             event_queue.put(event)
+    
+    def on_click(x, y, button, pressed):
+        if not focus_tracker.has_focus:
+            return  # Silently drop
+        
+        if pressed:
+            buttons_held.add(button_str)
+            event = {
+                "event_id": str(uuid.uuid4()),
+                "stream_type": "USER_INPUT",
+                "start_timestamp": time.time(),
+                "delta_timestamp": 0.0,
+                "payload_json": orjson.dumps({
+                    "type": "mouse_click",
+                    "button": str(button),
+                    "x": x,
+                    "y": y
+                }).decode('utf-8')
+            }
+            event_queue.put(event)
+
+    def on_scroll(x, y, dx, dy):
+        """Logs mouse scroll events."""
+        if not focus_tracker.has_focus:
+            return  # Silently drop
+        
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "stream_type": "USER_INPUT",
+            "start_timestamp": time.time(),
+            "delta_timestamp": 0.0,
+            "payload_json": orjson.dumps({
+                "type": "mouse_scroll",
+                "x": x,
+                "y": y,
+                "dx": dx,
+                "dy": dy
+            }).decode('utf-8')
+        }
+        event_queue.put(event)
+
+    def on_move(x, y):
+        if not focus_tracker.has_focus:
+            # If we lose focus during a trajectory, finalize it
+            if trajectory_tracker.trajectory_start_time is not None:
+                completed_trajectory = trajectory_tracker.force_finalize()
+                if completed_trajectory:
+                    _emit_trajectory(completed_trajectory, event_queue)
+            return
+        
+        # Determine current button state
+        current_button = list(buttons_held)[0] if buttons_held else None
+        
+        # Update trajectory tracker
+        completed_trajectory = trajectory_tracker.on_move(x, y, current_button)
+        
+        if completed_trajectory:
+            _emit_trajectory(completed_trajectory, event_queue)
+    
+    def _emit_trajectory(traj: MouseTrajectory, queue: Queue):
+        """Helper to convert trajectory to event and emit."""
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "stream_type": "USER_INPUT",
+            "start_timestamp": traj.start_time,
+            "delta_timestamp": traj.end_time - traj.start_time,
+            "payload_json": orjson.dumps({
+                "type": "mouse_trajectory",
+                "start_pos": traj.start_pos,
+                "end_pos": traj.end_pos,
+                "sample_points": traj.sample_points,  # Downsampled path
+                "button_held": traj.button_held,
+                "total_distance": traj.total_distance,
+                "linearity": traj.linearity,
+            }).decode('utf-8')
+        }
+        queue.put(event)
 
     # In a real app, you would add mouse listeners as well (on_click, on_move)
     keyboard_listener = pynput.keyboard.Listener(on_press=on_press, on_release=on_release)
+    mouse_listener = pynput.mouse.Listener(on_click=on_click, on_scroll=on_scroll)
     keyboard_listener.start()
+    mouse_listener.start()  # ← ADD THIS
     print("Input listener started.")
     keyboard_listener.join() # This blocks until the listener stops
+    mouse_listener.join()
+
+    # Clean up focus tracker
+    focus_tracker.stop()
 
 def video_encoding_worker_loop(task_queue, result_queue, output_path):
     # This worker gets its own encoder instance

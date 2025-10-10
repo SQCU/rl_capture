@@ -20,6 +20,7 @@ dependencies = [
     # Frame & Input Capture
     "mss",
     "pynput",
+    "pywinctl", # needed to avoid keylogging whole-system events, tainting yummy action-state-model data.
     # Data Handling & Serialization
     "pyarrow",
     "orjson",

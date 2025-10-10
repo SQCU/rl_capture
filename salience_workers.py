@@ -11,6 +11,7 @@ from transformers import AutoModel, AutoProcessor, AutoModelForCausalLM, AutoIma
 from PIL import Image
 from collections import deque
 import queue # --- NEW ---
+import gc
 
 # --- NEW: Import our new tracker classes ---
 from salience_trackers import NaiveZScoreTracker, PCAMahanalobisTracker, TRACKER_STRATEGIES
@@ -66,7 +67,7 @@ class SigLIPKernel(SalienceKernel):
     """The expert on whole-image visual semantics."""
     def __init__(self, config: dict):
         super().__init__(config)
-        self.kernel_name = "VISUAL_SEMANTIC"
+        self.kernel_name = "SIGLIP"
         
         model_path = "./models/siglip"
         if not os.path.isdir(model_path): raise FileNotFoundError(f"SigLIP model not found at '{model_path}'.")
@@ -85,21 +86,80 @@ class OCRLatentKernel(SalienceKernel):
     """The expert on typographic change and drift."""
     def __init__(self, config: dict):
         super().__init__(config)
-        self.kernel_name = "OCR_LATENT"
+        self.kernel_name = "OCR"
         
         model_path = "./models/dots_ocr"
-        if not os.path.isdir(model_path): raise FileNotFoundError(f"DOTS.ocr model not found at '{model_path}'.")
         model_kwargs = {"attn_implementation": "sdpa", "dtype": torch.bfloat16} if self.device.type == 'cuda' else {}
-        self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, **model_kwargs).to(self.device)
+        
+        # --- THE "LOAD AND PLUCK" STRATEGY ---
+
+        # 1. Load the full, memory-intensive Causal LM into VRAM temporarily.
+        #    This is the step that allocates the ~36GB.
+        print(f"[{self.kernel_name}] Temporarily loading full Causal LM to extract vision tower...")
+        full_model = AutoModelForCausalLM.from_pretrained(
+            model_path, 
+            trust_remote_code=True, 
+            **model_kwargs
+        ).to(self.device)
+
+        # 2. Immediately extract the vision tower module. This is just a reference.
+        #    The actual weights are still part of the `full_model` graph in VRAM.
+        print(f"[{self.kernel_name}] Plucking the vision tower...")
+        self.encoder = full_model.vision_tower
+
+        # 3. CRITICAL: Delete the reference to the full model.
+        print(f"[{self.kernel_name}] Deleting reference to the full model...")
+        del full_model
+
+        # 4. CRITICAL: Force Python's garbage collector and PyTorch's cache to run.
+        #    This tells PyTorch to release the gigabytes of VRAM that were part of the
+        #    language model, as they are no longer referenced by any object.
+        print(f"[{self.kernel_name}] Clearing garbage and CUDA cache...")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # By this point, only the vision_tower's weights should remain in VRAM.
+        print(f"[{self.kernel_name}] Vision tower extracted. VRAM should now be freed.")
+        self.encoder.eval() # Ensure it's in eval mode
+
+        # The processor is loaded as usual
         self.processor = AutoImageProcessor.from_pretrained(model_path, trust_remote_code=True)
-        self.encoder = self.model.vision_tower.to(device=self.device).eval()
 
     @torch.no_grad()
     def get_latents_for_images(self, images: list[Image.Image]) -> torch.Tensor:
+        # 1. Get inputs from the processor
         inputs = self.processor(images=images, return_tensors="pt")
-        pixel_values = inputs['pixel_values'].to(self.device, dtype=self.model.dtype)
+        pixel_values = inputs['pixel_values'].to(self.device, dtype=self.encoder.dtype)
         grid_thw = inputs['image_grid_thw'].to(self.device)
-        return self.encoder(pixel_values, grid_thw=grid_thw).flatten(start_dim=1)
+
+        # 2. Get the final embeddings from the vision tower.
+        # Shape is [total_merged_tokens_in_batch, hidden_size]
+        final_embeddings = self.encoder(hidden_states=pixel_values, grid_thw=grid_thw)
+        
+        # --- THE FIX: Structured Pooling ---
+        # 3. We need to average the tokens that belong to each image separately.
+        
+        # Get the spatial merge size from the model's config
+        spatial_merge_size = self.encoder.config.spatial_merge_size
+        
+        # Calculate how many merged tokens each image in the batch produces.
+        # grid_thw[:, 1] is height, grid_thw[:, 2] is width.
+        merged_h = grid_thw[:, 1] // spatial_merge_size
+        merged_w = grid_thw[:, 2] // spatial_merge_size
+        tokens_per_image = (merged_h * merged_w).tolist()
+
+        # 4. Split the embedding tensor into chunks, one for each image.
+        image_embedding_chunks = torch.split(final_embeddings, tokens_per_image, dim=0)
+        
+        # 5. Average the tokens within each chunk to get a single vector per image.
+        #    We average across dim=0 of each chunk.
+        averaged_chunks = [chunk.mean(dim=0) for chunk in image_embedding_chunks]
+        
+        # 6. Stack the averaged vectors back into a single 2D tensor.
+        #    The final shape is [batch_size, hidden_size], which is what PCA expects.
+        latent_vectors = torch.stack(averaged_chunks, dim=0)
+        
+        return latent_vectors
 
 # =====================================================================================
 #  NEW ARCHITECTURE: The Search Manager (The "Brain")
@@ -136,18 +196,37 @@ class HierarchicalSearchManager:
 
     @torch.no_grad()
     def _get_latents_for_indices(self, frames_chunk: list, indices: list[int]) -> dict[str, torch.Tensor]:
-        indices_to_compute = [i for i in indices if any((k.kernel_name, i) not in self.latent_cache for k in self.kernels)]
-        
-        if indices_to_compute:
-            for i in range(0, len(indices_to_compute), self.config.get('max_batch_size', 16)):
-                batch_indices = indices_to_compute[i : i + self.config.get('max_batch_size', 16)]
+        # This method needs a significant rewrite to handle per-kernel batching.
+
+        # 1. Figure out what needs computing for each kernel
+        work_items_by_kernel = {k.kernel_name: [] for k in self.kernels}
+        for i in indices:
+            for k in self.kernels:
+                if (k.kernel_name, i) not in self.latent_cache:
+                    work_items_by_kernel[k.kernel_name].append(i)
+
+        # 2. Process each kernel's work items with its own batch size
+        for kernel in self.kernels:
+            kernel_name = kernel.kernel_name
+            indices_to_compute = list(set(work_items_by_kernel[kernel_name])) # Use set to remove duplicates
+            if not indices_to_compute:
+                continue
+
+            # --- THE CRITICAL CHANGE ---
+            # Get the batch size specific to this kernel, with a fallback to a global default.
+            kernel_conf = self.config.get("kernel_configs", {}).get(kernel.kernel_name.lower(), {})
+            batch_size = kernel_conf.get('max_batch_size', 1) # Default to 1 for safety
+            print(f"[{self.worker_id}] Processing for {kernel_name} with batch size {batch_size}")
+
+            for i in range(0, len(indices_to_compute), batch_size):
+                batch_indices = indices_to_compute[i : i + batch_size]
                 images_to_process = [frames_chunk[idx] for idx in batch_indices]
                 
-                for kernel in self.kernels:
-                    latents_batch = kernel.get_latents_for_images(images_to_process)
-                    for idx, latent in zip(batch_indices, latents_batch):
-                        self.latent_cache[(kernel.kernel_name, idx)] = latent.to('cpu', non_blocking=True)
+                latents_batch = kernel.get_latents_for_images(images_to_process)
+                for idx, latent in zip(batch_indices, latents_batch):
+                    self.latent_cache[(kernel_name, idx)] = latent.to('cpu', non_blocking=True)
 
+        # 3. Assemble results (this part remains the same)
         results = {k.kernel_name: [] for k in self.kernels}
         for i in indices:
             for k in self.kernels:
@@ -181,7 +260,7 @@ class HierarchicalSearchManager:
 
             for i in novel_indices:
                 # The event corresponds to the transition *ending* at this frame
-                event_index = start_idx + i.item() + 1
+                event_index = start_idx + i.item()
                 event = kernel.create_keyframe_event(timestamps_chunk[event_index], float(cpu_scores[i]), "exhaustive_scan_spike")
                 keyframes_found.append(event) # Append to our local list
             

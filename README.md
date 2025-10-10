@@ -7,8 +7,8 @@ This is a tool for recording gameplay sessions for machine vision and reinforcem
 ## INDEV:
 major missing features:
 
-- PCA decomposition
-- re-add ocr model saliency capture
+X PCA decomposition (demi-implemented, hyperparameters aren't yet trustworthy)
+- performance-max OCR capture (extremely strains cpu incremental-pca on use)
 - rewrite to use obs-studio virtual camera API for various kinds of user data hygeine (avoid ever seeing emails or directories if user alt-tabs)
 - audio capture (lol)
 - reimplement low-level-of-detail low-bitrate 'baseline recording'
