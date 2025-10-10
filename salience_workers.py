@@ -158,82 +158,75 @@ class HierarchicalSearchManager:
         return results
 
     def _exhaustive_scan(self, frames_chunk: list, timestamps_chunk: list, start_idx: int, end_idx: int, search_log: list) -> list:
+        """
+        Performs a fine-grained scan, creating keyframes for every novel transition.
+        """
         span_indices = list(range(start_idx, end_idx + 1))
         if len(span_indices) < 2: return []
         
         all_latents_by_kernel = self._get_latents_for_indices(frames_chunk, span_indices)
-        all_keyframes = []
+        keyframes_found = [] # Local list to hold results
 
         search_log.append({'type': 'exhaustive_scan', 'span': (timestamps_chunk[start_idx], timestamps_chunk[end_idx]), 'num_frames': len(span_indices)})
 
         for kernel in self.kernels:
-            # The latents stay on the GPU as a torch.Tensor
             latents_tensor = all_latents_by_kernel[kernel.kernel_name]
+            kernel.tracker.update(latents_tensor) # Update the tracker first
 
-            # --- SIMPLIFIED: No more type checking needed! ---
-            # Both trackers now accept a GPU tensor. The PCA tracker handles its
-            # own CPU transfers internally during its `update` step.
             scores = kernel.tracker.get_novelty_scores(latents_tensor)
             is_novel_mask = kernel.tracker.is_novel(scores)
             
             novel_indices = torch.where(is_novel_mask)[0]
-
-            # Minimal CPU transfer for logging the final results
             cpu_scores = scores.detach().cpu().float().numpy()
-            for i in novel_indices:
-                event_index = start_idx + i.item()
-                event = kernel.create_keyframe_event(timestamps_chunk[event_index], float(cpu_scores[i]), "exhaustive_scan_spike")
-                all_keyframes.append(event)
-            
-            # The update call is now clean and polymorphic
-            kernel.tracker.update(latents_tensor)
-            
-        return all_keyframes
 
-    def _recursive_search_step(self, frames_chunk: list, search_queue: deque, start_idx: int, end_idx: int, depth: int, search_log: list):
+            for i in novel_indices:
+                # The event corresponds to the transition *ending* at this frame
+                event_index = start_idx + i.item() + 1
+                event = kernel.create_keyframe_event(timestamps_chunk[event_index], float(cpu_scores[i]), "exhaustive_scan_spike")
+                keyframes_found.append(event) # Append to our local list
+            
+        return keyframes_found # Return the list
+
+
+    def _recursive_search_step(self, frames_chunk: list, timestamps_chunk: list, search_queue: deque, start_idx: int, end_idx: int, depth: int, search_log: list) -> list:
         """
-        Performs the recursive, coarse-grained search step entirely on the GPU.
+        Performs a coarse-grained scan. It BOTH creates keyframes for novel coarse
+        transitions AND schedules deeper searches.
         """
         sentinel_indices = np.linspace(start_idx, end_idx, self.config['branching_factor'], dtype=int)
         all_latents_by_kernel = self._get_latents_for_indices(frames_chunk, sentinel_indices.tolist())
 
+        for kernel in self.kernels:
+            kernel.tracker.update(all_latents_by_kernel[kernel.kernel_name])
+        
+        keyframes_found = [] # Local list to hold results
         found_hotspot = False
         max_score_info = {'score': -1.0, 'span': None, 'reason': None}
 
         for i in range(len(sentinel_indices) - 1):
             sub_span_start, sub_span_end = int(sentinel_indices[i]), int(sentinel_indices[i+1])
-            is_interesting_span = False
             
-            # This variable will hold the score of the most interesting kernel for this span
-            span_top_score = -1.0
-
             for kernel in self.kernels:
-                # --- MODIFIED: All operations are now on GPU Tensors ---
-                
-                # 1. Slice the two relevant sentinel latents. This remains a GPU tensor.
                 latents_tensor_slice = all_latents_by_kernel[kernel.kernel_name][[i, i+1]]
-                
-                # 2. Get the novelty score. The tracker returns a single-element GPU tensor.
                 score_tensor = kernel.tracker.get_novelty_scores(latents_tensor_slice)[0]
-                
-                # 3. Ask the tracker if this score is novel.
-                # We unsqueeze to create a "batch" of 1 for the tracker.
                 is_novel_flag = kernel.tracker.is_novel(score_tensor.unsqueeze(0))[0]
 
-                # 4. Use .item() to get the Python boolean for control flow. No large data transfer.
                 if is_novel_flag.item():
-                    is_interesting_span = True
+                    # --- FIX: A surprising coarse transition IS a keyframe ---
+                    event_index = sub_span_end
+                    event = kernel.create_keyframe_event(timestamps_chunk[event_index], score_tensor.item(), "recursive_search_spike")
+                    keyframes_found.append(event)
+
+                    # Also schedule this span for a deeper look
+                    search_queue.append((sub_span_start, sub_span_end, depth + 1))
                     search_log.append({
                         'type': 'recursive_descent', 
                         'span_indices': (sub_span_start, sub_span_end), 
                         'reason': f'{kernel.kernel_name}_spike', 
-                        'score': score_tensor.item() # Use .item() for logging
+                        'score': score_tensor.item()
                     })
-                    break # One kernel is enough to flag the span as interesting.
-            
-            if is_interesting_span:
-                search_queue.append((sub_span_start, sub_span_end, depth + 1))
-                found_hotspot = True
+                    found_hotspot = True
+                    break # One kernel is enough to flag the span
             
             # --- MODIFIED: Also use .item() for the max score comparison ---
             # Get the scalar value of the last computed score
@@ -249,10 +242,19 @@ class HierarchicalSearchManager:
         if not found_hotspot and max_score_info['span'] is not None:
             search_queue.append((*max_score_info['span'], depth + 1))
             search_log.append({'type': 'recursive_descent_optimistic', **max_score_info})
+        return keyframes_found # Return the list
 
     def process_chunk(self, frames_chunk: list, timestamps_chunk: list, shutdown_event: Event) -> dict:
         self.latent_cache = {}
         if not frames_chunk: return {'keyframes': [], 'search_log': []}
+
+        # --- NEW: Perform an initial, full-chunk update for the trackers ---
+        # This is the most important fix. It "pre-warms" the model on the entire
+        # chunk's coarse representation before any scoring begins.
+        initial_sentinel_indices = np.linspace(0, len(frames_chunk) - 1, self.config['branching_factor'], dtype=int).tolist()
+        initial_latents = self._get_latents_for_indices(frames_chunk, initial_sentinel_indices)
+        for kernel in self.kernels:
+            kernel.tracker.update(initial_latents[kernel.kernel_name])
 
         search_queue = deque([(0, len(frames_chunk) - 1, 1)])
         final_events, search_log = [], []
@@ -262,14 +264,23 @@ class HierarchicalSearchManager:
                 if shutdown_event.is_set(): break
                 start_idx, end_idx, depth = search_queue.popleft()
                 
-                if (end_idx - start_idx + 1) <= self.config.get('min_exhaustive_size', 16):
-                    keyframes = self._exhaustive_scan(frames_chunk, timestamps_chunk, start_idx, end_idx, search_log)
-                    final_events.extend(keyframes)
+                keyframes_from_step = [] # Temp list to hold results from this step
+                
+                if (end_idx - start_idx + 1) <= self.config['min_exhaustive_size']:
+                    # Call the exhaustive scan and capture its results
+                    keyframes_from_step = self._exhaustive_scan(frames_chunk, timestamps_chunk, start_idx, end_idx, search_log)
                     pbar.update(end_idx - start_idx + 1)
                 else:
-                    self._recursive_search_step(frames_chunk, search_queue, start_idx, end_idx, depth, search_log)
+                    # Call the recursive scan and capture its results
+                    keyframes_from_step = self._recursive_search_step(frames_chunk, timestamps_chunk, search_queue, start_idx, end_idx, depth, search_log)
                     pbar.update(self.config['branching_factor'])
-        
+
+                # --- THE CRITICAL FIX ---
+                # Add the keyframes found in this step to the final list.
+                if keyframes_from_step:
+                    final_events.extend(keyframes_from_step)
+
+        pbar.update(pbar.total - pbar.n)
         return {'keyframes': final_events, 'search_log': search_log}
 
 

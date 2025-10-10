@@ -1,5 +1,6 @@
 # salience_trackers.py 
 
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -131,7 +132,7 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
         # --- NEW: An internal buffer to accumulate latents before fitting ---
         self.latent_buffer = []
         # We'll fit the model when the buffer reaches a reasonable size, e.g., twice the number of components.
-        self.fit_batch_size = self.config['pca_n_components'] * 2
+        self.fit_threshold = self.config['pca_n_components'] * 2
 
     def update(self, latents_batch: torch.Tensor):
         """
@@ -144,20 +145,27 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
         #    This is an infrequent operation, so the CPU transfer is acceptable.
         self.latent_buffer.extend(latents_batch.cpu().float().numpy())
         
-        # 2. Check if we have enough samples to perform a meaningful fit.
-        if len(self.latent_buffer) >= self.fit_batch_size:
-            # We have enough data, so perform the fit.
+        if len(self.latent_buffer) >= self.fit_threshold:
             fit_data = np.array(self.latent_buffer)
+            
+            # Check for the first-fit condition explicitly
+            if self.n_samples_seen == 0 and len(fit_data) < self.pca.n_components:
+                # This case should no longer happen with the buffer, but it's a safe guard.
+                return 
+
+            print(f"[{os.getpid()}/PCATracker] Fitting PCA with {len(fit_data)} new samples...")
             self.pca.partial_fit(fit_data)
             self.n_samples_seen += len(fit_data)
 
-            # Clear the buffer now that the data has been incorporated into the model.
+            # Clear the buffer now that the data is in the model.
             self.latent_buffer = []
 
-            # After fitting, transfer the small model parameters back to the GPU.
+            # After fitting, transfer the new model parameters to the GPU.
             self.mean_ = torch.from_numpy(self.pca.mean_).to(self.device, dtype=torch.float32)
             self.components_ = torch.from_numpy(self.pca.components_).to(self.device, dtype=torch.float32)
             self.explained_variance_ = torch.from_numpy(self.pca.explained_variance_).to(self.device, dtype=torch.float32)
+        else:
+            print(f"len(self.latent_buffer):{len(self.latent_buffer)}<=self.fit_threshold:{self.fit_threshold}, pooling...")
 
     def get_novelty_scores(self, latents_batch: torch.Tensor) -> torch.Tensor:
         """
@@ -195,12 +203,27 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
             if not np.isnan(score):
                 self.novelty_score_stats.update(score)
             
-        mean, std_dev = self.novelty_score_stats.mean, self.novelty_score_stats.std_dev
+            mean, std_dev = self.novelty_score_stats.mean, self.novelty_score_stats.std_dev
         if std_dev == 0:
             return torch.zeros_like(scores, dtype=torch.bool)
 
         threshold = mean + (std_dev * self.config['novelty_z_score_threshold'])
-        return scores > threshold
+        is_novel_mask = scores > threshold
+
+        # --- NEW: Detailed Logging for Tuning ---
+        # Use .any() to check if there are any spikes without a CPU transfer
+        if is_novel_mask.any():
+            # Only transfer data to CPU for printing if a spike was detected
+            cpu_scores = scores.detach().cpu().numpy()
+            cpu_mask = is_novel_mask.cpu().numpy()
+            for i in np.where(cpu_mask)[0]:
+                print(
+                    f"[PCATracker] KEYFRAME DETECTED! "
+                    f"Score: {cpu_scores[i]:.4f} > Threshold: {threshold:.4f} "
+                    f"(Mean: {mean:.4f}, StdDev: {std_dev:.4f}, Z-Score: {(cpu_scores[i]-mean)/std_dev:.2f})"
+                )
+        
+        return is_novel_mask
 
 # --- NEW: A factory dictionary to map config strings to classes ---
 TRACKER_STRATEGIES = {

@@ -49,7 +49,7 @@ STRATEGY_CONFIGS = {
     "pca_mahalanobis": {
         "pca_n_components": 16,      # Max components (top-k guardrail).
         "pca_variance_threshold": 0.95, # The variance to capture (top-p).
-        "novelty_z_score_threshold": 1.0, # Z-score threshold for the Mahalanobis scores themselves.
+        "novelty_z_score_threshold": 2.0, # Z-score threshold for the Mahalanobis scores themselves.
         "branching_factor": 8, # Override the worker's default of 8
         "min_exhaustive_size": 16, # Override the worker's default of 16
     }
