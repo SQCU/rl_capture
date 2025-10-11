@@ -19,6 +19,7 @@ from threading import Thread, Lock
 from PIL import Image
 from collections import deque
 from dataclasses import dataclass
+import psutil
 
 # We now need one of the salience workers in the Triage process itself
 import salience_workers as sal_wo
@@ -60,7 +61,7 @@ STRATEGY_CONFIGS = {
                 "max_batch_size": 16 # SigLIP is efficient
             },
             "ocr": {
-                "max_batch_size": 4   # OCR model is huge, process one by one
+                "max_batch_size": 8   # OCR model is huge, process one by one
             }
     }
 }
@@ -819,6 +820,7 @@ class VideoEncoder:
         self.active_processes = [] # Keep track of all processes
         self.lock = Lock() # To safely append to the list from multiple workers
 
+
     def start_encode_slice(self, frames: np.ndarray, timestamps: np.ndarray, quality: str) -> subprocess.Popen:
         """
         Launches an ffmpeg process asynchronously to encode a set of frames.
@@ -872,6 +874,10 @@ class VideoEncoder:
 
         # Start the process with stdin piped
         proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ps_proc = psutil.Process(proc.pid)
+
+        ps_proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS) # For Windows
+        # ps_p.nice(10) # For Linux (higher number is lower priority)
 
         with self.lock:
             self.active_processes.append(proc)
@@ -926,6 +932,10 @@ class VideoEncoder:
         ]
 
         proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        ps_proc = psutil.Process(proc.pid)
+
+        ps_proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS) # For Windows
+        # ps_p.nice(10) # For Linux (higher number is lower priority)
         
         return proc, proc.stdin
 

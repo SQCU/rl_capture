@@ -183,6 +183,11 @@ class HierarchicalSearchManager:
         if config:
             self.config.update(config)
 
+        self.siglip_stream = torch.cuda.Stream()
+        self.ocr_stream = torch.cuda.Stream()
+        # A map to make it easy to look up
+        self.kernel_streams = {"SIGLIP": self.siglip_stream, "OCR": self.ocr_stream}
+
     def _get_default_search_config(self) -> dict:
         """
         Provides a centralized, fallback configuration for the search process.
@@ -208,7 +213,8 @@ class HierarchicalSearchManager:
         # 2. Process each kernel's work items with its own batch size
         for kernel in self.kernels:
             kernel_name = kernel.kernel_name
-            indices_to_compute = list(set(work_items_by_kernel[kernel_name])) # Use set to remove duplicates
+            stream = self.kernel_streams.get(kernel_name) # Get the specific stream
+            indices_to_compute = list(dict.fromkeys(work_items_by_kernel[kernel_name]))
             if not indices_to_compute:
                 continue
 
@@ -219,12 +225,18 @@ class HierarchicalSearchManager:
             print(f"[{self.worker_id}] Processing for {kernel_name} with batch size {batch_size}")
 
             for i in range(0, len(indices_to_compute), batch_size):
-                batch_indices = indices_to_compute[i : i + batch_size]
-                images_to_process = [frames_chunk[idx] for idx in batch_indices]
-                
-                latents_batch = kernel.get_latents_for_images(images_to_process)
-                for idx, latent in zip(batch_indices, latents_batch):
-                    self.latent_cache[(kernel_name, idx)] = latent.to('cpu', non_blocking=True)
+                # Tell PyTorch to run this block of work on the kernel's dedicated stream
+                with torch.cuda.stream(stream):
+                    batch_indices = indices_to_compute[i : i + batch_size]
+                    images_to_process = [frames_chunk[idx] for idx in batch_indices]
+                    
+                    latents_batch = kernel.get_latents_for_images(images_to_process)
+                    for idx, latent in zip(batch_indices, latents_batch):
+                        # The cache put happens within the stream context
+                        self.latent_cache[(kernel_name, idx)] = latent.to('cpu', non_blocking=True)
+
+        # After launching all work, you need to synchronize
+        torch.cuda.synchronize() # Wait for all streams to finish before assembling results
 
         # 3. Assemble results (this part remains the same)
         results = {k.kernel_name: [] for k in self.kernels}

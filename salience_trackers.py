@@ -10,6 +10,9 @@ from collections import deque
 
 from torch_incremental_pca import IncrementalPCA as TorchIncrementalPCA
 
+import logging
+from logging.handlers import QueueHandler
+
 # We still need OnlineStats for our trackers
 class OnlineStats:
     """Implements Welford's algorithm for stable online variance calculation."""
@@ -201,9 +204,9 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
             # self.mean_ = torch.from_numpy(self.pca.mean_).to(self.device, dtype=torch.float32)
             # self.components_ = torch.from_numpy(self.pca.components_).to(self.device, dtype=torch.float32)
             # self.explained_variance_ = torch.from_numpy(self.pca.explained_variance_).to(self.device, dtype=torch.float32)
-        else:
+        #else:
             # Minor change for accurate logging
-            print(f"len(self.latent_buffer):{sum(t.shape[0] for t in self.latent_buffer)}<=self.fit_threshold:{self.fit_threshold}, pooling...")
+            #print(f"len(self.latent_buffer):{sum(t.shape[0] for t in self.latent_buffer)}<=self.fit_threshold:{self.fit_threshold}, pooling...")
 
 
     def get_novelty_scores(self, latents_batch: torch.Tensor) -> torch.Tensor:
