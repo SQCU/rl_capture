@@ -10,9 +10,6 @@ from collections import deque
 
 from torch_incremental_pca import IncrementalPCA as TorchIncrementalPCA
 
-import logging
-from logging.handlers import QueueHandler
-
 # We still need OnlineStats for our trackers
 class OnlineStats:
     """Implements Welford's algorithm for stable online variance calculation."""
@@ -204,7 +201,7 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
             # self.mean_ = torch.from_numpy(self.pca.mean_).to(self.device, dtype=torch.float32)
             # self.components_ = torch.from_numpy(self.pca.components_).to(self.device, dtype=torch.float32)
             # self.explained_variance_ = torch.from_numpy(self.pca.explained_variance_).to(self.device, dtype=torch.float32)
-        #else:
+        else:
             # Minor change for accurate logging
             #print(f"len(self.latent_buffer):{sum(t.shape[0] for t in self.latent_buffer)}<=self.fit_threshold:{self.fit_threshold}, pooling...")
 
@@ -280,11 +277,13 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
                 # Z-score is now calculated with pure Python floats.
                 z_score = (score_val - mean_val) / std_dev_val if std_dev_val > 0 else 0.0
 
+                """
                 print(
                     f"[PCATracker] KEYFRAME DETECTED! "
                     f"Score: {score_val:.4f} > Threshold: {threshold_val:.4f} "
                     f"(Mean: {mean_val:.4f}, StdDev: {std_dev_val:.4f}, Z-Score: {z_score:.2f})"
                 )
+                """
         
         return is_novel_mask
 
