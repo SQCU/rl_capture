@@ -330,7 +330,7 @@ def input_capture_worker(event_queue: Queue):
     def on_click(x, y, button, pressed):
         if not focus_tracker.has_focus:
             return  # Silently drop
-        
+        button_str = str(button)
         if pressed:
             buttons_held.add(button_str)
             event = {
@@ -340,12 +340,16 @@ def input_capture_worker(event_queue: Queue):
                 "delta_timestamp": 0.0,
                 "payload_json": orjson.dumps({
                     "type": "mouse_click",
-                    "button": str(button),
+                    "button": button_str,
                     "x": x,
                     "y": y
                 }).decode('utf-8')
             }
             event_queue.put(event)
+        else: # This handles the button release
+            # --- FIX #3: Remove the button from the set when it's released ---
+            # Using .discard() is safer than .remove() as it won't error if the key is missing.
+            buttons_held.discard(button_str)
 
     def on_scroll(x, y, dx, dy):
         """Logs mouse scroll events."""
@@ -549,7 +553,7 @@ def dispatcher_loop(raw_frame_queue: Queue, salience_task_queue: Queue, shm_noti
 
             # --- MODIFIED: The logic is now radically simpler ---
             if len(frame_buffer) == frames_per_chunk:
-                print(f"[{worker_pid}] Dispatcher: Staging {len(frame_buffer)}-frame chunk for analysis.")
+                #print(f"[{worker_pid}] Dispatcher: Staging {len(frame_buffer)}-frame chunk for analysis.")
                 
                 timestamps, frames = zip(*frame_buffer)
                 
@@ -621,7 +625,7 @@ class Orchestrator:
                         # Open our own handle to the SHM block, keeping it alive.
                         shm = shared_memory.SharedMemory(name=shm_name)
                         self.active_shm_blocks[shm_name] = shm
-                        print(f"Orchestrator: Registered and claimed SHM block {shm_name}.")
+                        #print(f"Orchestrator: Registered and claimed SHM block {shm_name}.")
                     except FileNotFoundError:
                         print(f"Orchestrator WARNING: Triage notified of {shm_name}, but it disappeared before we could claim it.")
 
@@ -633,7 +637,7 @@ class Orchestrator:
                 # 2. Check for completed video encodes
                 if not self.encoding_results_queue.empty():
                     result = self.encoding_results_queue.get_nowait()
-                    print(f"Orchestrator: Confirmed completion of encode job.")
+                    #print(f"Orchestrator: Confirmed completion of encode job.")
                     # In a more complex system, you might log this completion.
                 
                 time.sleep(0.05)
@@ -652,17 +656,8 @@ class Orchestrator:
         keyframes = data.get('keyframes', [])
         search_log = data.get('search_log', [])
 
-        shm_to_clean = self.active_shm_blocks.pop(shm_name, None)
-        if shm_to_clean:
-            shm_to_clean.close()
-            shm_to_clean.unlink()
-            print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
-        else:
-            # This can happen in rare race conditions on shutdown, it's safe to log.
-            print(f"Orchestrator WARNING: Worker reported on {shm_name}, but it was not in our active registry.")
-
         # --- Now, handle the results ---
-        print(f"Orchestrator: Received {len(keyframes)} keyframes and {len(search_log)} search log entries from {shm_name}.")
+        #print(f"Orchestrator: Received {len(keyframes)} keyframes and {len(search_log)} search log entries from {shm_name}.")
 
         # --- NEW: Persist the search log for a detailed timeline ---
         if search_log:
@@ -707,7 +702,7 @@ class Orchestrator:
                 })
             
             if video_encode_jobs:
-                print(f"Orchestrator: Merged {len(keyframes)} events into {len(video_encode_jobs)} encoding job(s).")
+                #print(f"Orchestrator: Merged {len(keyframes)} events into {len(video_encode_jobs)} encoding job(s).")
                 # We need to re-attach to the SHM to get frame data for the encoder
                 try:
                     shm = shared_memory.SharedMemory(name=shm_name)
@@ -732,7 +727,8 @@ class Orchestrator:
                     shm.close()
 
                 except FileNotFoundError:
-                    print(f"WARNING: Could not find SHM block {shm_name} for encoding. It may have been cleaned up already.")
+                    pass
+                    #print(f"WARNING: Could not find SHM block {shm_name} for encoding. It may have been cleaned up already.")
 
             # --- Cleanup ---
             # The salience worker is done, and we have dispatched encoding.
@@ -741,9 +737,9 @@ class Orchestrator:
             if shm_to_clean:
                 shm_to_clean.close()
                 shm_to_clean.unlink()
-                print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
+                #print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
             else:
-                print(f"Orchestrator WARNING: Tried to clean up {shm_name}, but it was not in our active registry.")
+                #print(f"Orchestrator WARNING: Tried to clean up {shm_name}, but it was not in our active registry.")
                 # As a fallback, try to unlink it anyway in case of a state mismatch
                 try:
                     shm_fallback = shared_memory.SharedMemory(name=shm_name)

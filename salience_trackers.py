@@ -191,7 +191,7 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
             if self.n_samples_seen == 0 and len(fit_data) < self.pca.n_components:
                 return 
 
-            print(f"[{os.getpid()}/PCATracker] Fitting PCA with {len(fit_data)} new samples... (ON GPU)")
+            #print(f"[{os.getpid()}/PCATracker] Fitting PCA with {len(fit_data)} new samples... (ON GPU)")
             # --- THIS IS THE KEY: This call is now non-blocking and runs on the GPU. ---
             self.pca.partial_fit(fit_data)
             self.n_samples_seen += len(fit_data)
@@ -201,9 +201,9 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
             # self.mean_ = torch.from_numpy(self.pca.mean_).to(self.device, dtype=torch.float32)
             # self.components_ = torch.from_numpy(self.pca.components_).to(self.device, dtype=torch.float32)
             # self.explained_variance_ = torch.from_numpy(self.pca.explained_variance_).to(self.device, dtype=torch.float32)
-        else:
+        #else:
             # Minor change for accurate logging
-            #print(f"len(self.latent_buffer):{sum(t.shape[0] for t in self.latent_buffer)}<=self.fit_threshold:{self.fit_threshold}, pooling...")
+            ##print(f"len(self.latent_buffer):{sum(t.shape[0] for t in self.latent_buffer)}<=self.fit_threshold:{self.fit_threshold}, pooling...")
 
 
     def get_novelty_scores(self, latents_batch: torch.Tensor) -> torch.Tensor:
@@ -278,7 +278,7 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
                 z_score = (score_val - mean_val) / std_dev_val if std_dev_val > 0 else 0.0
 
                 """
-                print(
+                #print(
                     f"[PCATracker] KEYFRAME DETECTED! "
                     f"Score: {score_val:.4f} > Threshold: {threshold_val:.4f} "
                     f"(Mean: {mean_val:.4f}, StdDev: {std_dev_val:.4f}, Z-Score: {z_score:.2f})"

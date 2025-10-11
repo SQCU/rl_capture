@@ -49,7 +49,7 @@ class SalienceKernel:
         # Each kernel gets its own, independent statistical tracker.
         tracker_class = TRACKER_STRATEGIES[config['salience_strategy']]
         self.tracker = tracker_class(config)
-        print(f"[{self.kernel_name}_{os.getpid()}] Initialized with tracker: {config['salience_strategy']}")
+       #print(f"[{self.kernel_name}_{os.getpid()}] Initialized with tracker: {config['salience_strategy']}")
 
     @torch.no_grad()
     def get_latents_for_images(self, images: list[Image.Image]) -> torch.Tensor:
@@ -95,7 +95,7 @@ class OCRLatentKernel(SalienceKernel):
 
         # 1. Load the full, memory-intensive Causal LM into VRAM temporarily.
         #    This is the step that allocates the ~36GB.
-        print(f"[{self.kernel_name}] Temporarily loading full Causal LM to extract vision tower...")
+       #print(f"[{self.kernel_name}] Temporarily loading full Causal LM to extract vision tower...")
         full_model = AutoModelForCausalLM.from_pretrained(
             model_path, 
             trust_remote_code=True, 
@@ -104,22 +104,22 @@ class OCRLatentKernel(SalienceKernel):
 
         # 2. Immediately extract the vision tower module. This is just a reference.
         #    The actual weights are still part of the `full_model` graph in VRAM.
-        print(f"[{self.kernel_name}] Plucking the vision tower...")
+       #print(f"[{self.kernel_name}] Plucking the vision tower...")
         self.encoder = full_model.vision_tower
 
         # 3. CRITICAL: Delete the reference to the full model.
-        print(f"[{self.kernel_name}] Deleting reference to the full model...")
+       #print(f"[{self.kernel_name}] Deleting reference to the full model...")
         del full_model
 
         # 4. CRITICAL: Force Python's garbage collector and PyTorch's cache to run.
         #    This tells PyTorch to release the gigabytes of VRAM that were part of the
         #    language model, as they are no longer referenced by any object.
-        print(f"[{self.kernel_name}] Clearing garbage and CUDA cache...")
+       #print(f"[{self.kernel_name}] Clearing garbage and CUDA cache...")
         gc.collect()
         torch.cuda.empty_cache()
 
         # By this point, only the vision_tower's weights should remain in VRAM.
-        print(f"[{self.kernel_name}] Vision tower extracted. VRAM should now be freed.")
+       #print(f"[{self.kernel_name}] Vision tower extracted. VRAM should now be freed.")
         self.encoder.eval() # Ensure it's in eval mode
 
         # The processor is loaded as usual
@@ -192,7 +192,7 @@ class HierarchicalSearchManager:
         """
         Provides a centralized, fallback configuration for the search process.
         """
-        print(f"[{self.worker_id}] Loading default search configuration.")
+       #print(f"[{self.worker_id}] Loading default search configuration.")
         return {
             "branching_factor": 8,       # How many sentinel frames to check per chunk
             "min_exhaustive_size": 16,   # Chunks smaller than this are always processed fully
@@ -222,7 +222,7 @@ class HierarchicalSearchManager:
             # Get the batch size specific to this kernel, with a fallback to a global default.
             kernel_conf = self.config.get("kernel_configs", {}).get(kernel.kernel_name.lower(), {})
             batch_size = kernel_conf.get('max_batch_size', 1) # Default to 1 for safety
-            print(f"[{self.worker_id}] Processing for {kernel_name} with batch size {batch_size}")
+           #print(f"[{self.worker_id}] Processing for {kernel_name} with batch size {batch_size}")
 
             for i in range(0, len(indices_to_compute), batch_size):
                 # Tell PyTorch to run this block of work on the kernel's dedicated stream
@@ -350,7 +350,7 @@ class HierarchicalSearchManager:
         search_queue = deque([(0, len(frames_chunk) - 1, 1)])
         final_events, search_log = [], []
 
-        with tqdm(total=len(frames_chunk), desc=f"[{self.worker_id}] Search", unit="frame", position=0) as pbar:
+        with tqdm(total=len(frames_chunk), desc=f"[{self.worker_id}] Search", unit="frame", position=0, disable=True) as pbar:
             while search_queue:
                 if shutdown_event.is_set(): break
                 start_idx, end_idx, depth = search_queue.popleft()
@@ -395,14 +395,14 @@ KERNEL_REGISTRY = {
 
 def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown_event):
     worker_pid = os.getpid()
-    print(f"[{worker_pid}] Analysis worker started.")
+   #print(f"[{worker_pid}] Analysis worker started.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config['device']=device
 
     # --- Instantiate all enabled kernels based on config ---
     kernels_to_load = config.get("salience_kernels", ["siglip"])
     kernels = []
-    print(f"[{worker_pid}] Loading kernels: {kernels_to_load}")
+   #print(f"[{worker_pid}] Loading kernels: {kernels_to_load}")
     if "siglip" in kernels_to_load:
         kernels.append(SigLIPKernel(config))
     if "ocr" in kernels_to_load:
@@ -435,8 +435,8 @@ def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown
         except queue.Empty:
             continue
         except Exception as e:
-            print(f"[{worker_pid}] CRITICAL ERROR in worker loop: {e}")
+           #print(f"[{worker_pid}] CRITICAL ERROR in worker loop: {e}")
             import traceback; traceback.print_exc()
             
-    print(f"[{worker_pid}] Analysis worker finished.")
+   #print(f"[{worker_pid}] Analysis worker finished.")
 
