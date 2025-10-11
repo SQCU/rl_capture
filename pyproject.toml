@@ -37,7 +37,8 @@ dependencies = [
     "protobuf",
     "pywin32",
     'accelerate>=0.26.0',
-    'scikit-learn'
+    'scikit-learn',
+    'torch_incremental_pca'
 ]
 
 [project.urls]

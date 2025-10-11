@@ -8,6 +8,8 @@ from sklearn.decomposition import IncrementalPCA
 from scipy.spatial.distance import mahalanobis
 from collections import deque
 
+from torch_incremental_pca import IncrementalPCA as TorchIncrementalPCA
+
 # We still need OnlineStats for our trackers
 class OnlineStats:
     """Implements Welford's algorithm for stable online variance calculation."""
@@ -155,7 +157,7 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
         super().__init__(config)
         # --- MODIFIED: The PCA model now lives on the GPU. ---
         # self.pca = IncrementalPCA(n_components=self.config['pca_n_components']) # --- REMOVED ---
-        self.pca = TorchIncrementalPCA(n_components=self.config['pca_n_components'], device=self.device) # +++ ADDED +++
+        self.pca = TorchIncrementalPCA(n_components=self.config['pca_n_components']) # +++ ADDED +++
         
         # --- REMOVED: We no longer need to manually cache parameters on the GPU. ---
         # self.mean_ = None
@@ -211,48 +213,74 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
         """
         # --- MODIFIED: Access parameters directly from the GPU model. ---
         # if self.mean_ is None or self.n_samples_seen <= self.config['pca_n_components']: # --- REMOVED ---
-        if self.pca.mean_ is None or self.n_samples_seen <= self.config['pca_n_components']: # +++ ADDED +++
+        if not hasattr(self.pca, 'mean_') or self.pca.mean_ is None or self.n_samples_seen <= self.config['pca_n_components']: # +++ ADDED +++
             return torch.zeros(len(latents_batch), device=self.device)
 
-        # Access all parameters directly from the torch-native pca object
+        # Get the dtype from the incoming data itself. This is robust.
+        dtype = latents_batch.dtype
+
+        # --- THIS IS THE MISSING PART ---
+        # 2. Dynamically determine the number of components to use based on variance.
+        #    Access the explained_variance_ directly from the pca object.
         explained_variance_ = self.pca.explained_variance_
         cumulative_variance = torch.cumsum(explained_variance_ / torch.sum(explained_variance_), dim=0)
+        # Use .item() to get a Python int for slicing
         k_dynamic = torch.searchsorted(cumulative_variance, self.config['pca_variance_threshold']).item() + 1
-        
-        components = self.pca.components_[:k_dynamic]
-        variance = explained_variance_[:k_dynamic]
-        
-        transformed = (latents_batch - self.pca.mean_) @ components.T
-        
+        # Explicitly cast the PCA's state tensors to match our data's dtype
+        mean = self.pca.mean_.to(dtype)
+        components = self.pca.components_[:k_dynamic].to(dtype)
+        variance = self.pca.explained_variance_[:k_dynamic].to(dtype)
+
+        # Now, all tensors in this calculation will have the same dtype.
+        transformed = (latents_batch - mean) @ components.T
         epsilon = 1e-8
         sq_mahalanobis = torch.sum((transformed ** 2) / (variance + epsilon), dim=1)
         
         return torch.sqrt(sq_mahalanobis)
 
     def is_novel(self, scores: torch.Tensor) -> torch.Tensor:
-        # --- MODIFIED: Update stats in a single, non-blocking GPU call. ---
-        # cpu_scores = scores.detach().cpu().float().numpy() # --- REMOVED ---
-        # for score in cpu_scores: # --- REMOVED ---
-        #     if not np.isnan(score): # --- REMOVED ---
-        #         self.novelty_score_stats.update(score) # --- REMOVED ---
-        self.novelty_score_stats.update(scores.detach()[~torch.isnan(scores)]) # +++ ADDED +++
+        # --- GPU-NATIVE PART ---
 
+        # 1. Update stats with the new scores (happens on GPU).
+        self.novelty_score_stats.update(scores.detach()[~torch.isnan(scores)])
+
+        # 2. Get the current mean and std_dev (still GPU tensors).
         mean, std_dev = self.novelty_score_stats.mean, self.novelty_score_stats.std_dev
+        
+        # Handle the edge case of no variance yet.
         if std_dev == 0:
             return torch.zeros_like(scores, dtype=torch.bool)
 
+        # 3. Calculate the threshold and the novelty mask (all on GPU).
         threshold = mean + (std_dev * self.config['novelty_z_score_threshold'])
         is_novel_mask = scores > threshold
 
-        # The logging part remains largely the same, as printing requires CPU transfer anyway.
+        # --- CPU-LOGGING PART (Only runs if needed) ---
+
+        # 4. Conditionally enter the logging block ONLY if a keyframe was detected.
+        #    This avoids expensive GPU->CPU transfers on every call.
         if is_novel_mask.any():
+            
+            # 5. NOW, we perform the minimal necessary data transfers for printing.
             cpu_scores = scores.detach().cpu().float().numpy()
-            cpu_mask = is_novel_mask.cpu().float().numpy()
+            cpu_mask = is_novel_mask.cpu().numpy()
+
+            # 6. Convert all GPU TENSORS to Python SCALARS before the loop.
+            threshold_val = threshold.item()
+            mean_val = mean.item()  # or self.novelty_score_stats.mean.item()
+            std_dev_val = std_dev.item() # or self.novelty_score_stats.std_dev.item()
+
+            # 7. Loop and print using the safe, scalar Python variables.
             for i in np.where(cpu_mask)[0]:
+                score_val = cpu_scores[i]
+                
+                # Z-score is now calculated with pure Python floats.
+                z_score = (score_val - mean_val) / std_dev_val if std_dev_val > 0 else 0.0
+
                 print(
                     f"[PCATracker] KEYFRAME DETECTED! "
-                    f"Score: {cpu_scores[i]:.4f} > Threshold: {threshold:.4f} "
-                    f"(Mean: {mean:.4f}, StdDev: {std_dev:.4f}, Z-Score: {(cpu_scores[i]-mean)/std_dev:.2f})"
+                    f"Score: {score_val:.4f} > Threshold: {threshold_val:.4f} "
+                    f"(Mean: {mean_val:.4f}, StdDev: {std_dev_val:.4f}, Z-Score: {z_score:.2f})"
                 )
         
         return is_novel_mask

@@ -4275,6 +4275,7 @@ dependencies = [
     { name = "sentencepiece" },
     { name = "torch", version = "2.6.0+cu124", source = { registry = "https://download.pytorch.org/whl/cu124" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "torch-incremental-pca" },
     { name = "torchaudio", version = "2.6.0+cu124", source = { registry = "https://download.pytorch.org/whl/cu124" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { name = "torchaudio", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torchvision", version = "0.21.0+cu124", source = { registry = "https://download.pytorch.org/whl/cu124" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
@@ -4318,6 +4319,7 @@ requires-dist = [
     { name = "sentencepiece" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", marker = "sys_platform == 'linux' or sys_platform == 'win32'", index = "https://download.pytorch.org/whl/cu124" },
+    { name = "torch-incremental-pca" },
     { name = "torchaudio", marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torchaudio", marker = "sys_platform == 'linux' or sys_platform == 'win32'", index = "https://download.pytorch.org/whl/cu124" },
     { name = "torchvision", marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
@@ -5017,6 +5019,22 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/de/69/8b7b13bba430f5e21d77708b616f767683629fc4f8037564a177d20f90ed/torch-2.8.0-cp313-cp313t-macosx_14_0_arm64.whl", hash = "sha256:1a62a1ec4b0498930e2543535cf70b1bef8c777713de7ceb84cd79115f553767", size = 73915128, upload-time = "2025-08-06T14:54:34.769Z" },
     { url = "https://files.pythonhosted.org/packages/04/6e/650bb7f28f771af0cb791b02348db8b7f5f64f40f6829ee82aa6ce99aabe/torch-2.8.0-cp313-none-macosx_11_0_arm64.whl", hash = "sha256:7b677e17f5a3e69fdef7eb3b9da72622f8d322692930297e4ccb52fefc6c8211", size = 73632395, upload-time = "2025-08-06T14:55:28.645Z" },
     { url = "https://files.pythonhosted.org/packages/ae/95/ae26263aceb3d57b821179f827d0e321373ed49423e603dd5906ab14a730/torch-2.8.0-cp39-none-macosx_11_0_arm64.whl", hash = "sha256:e9f071f5b52a9f6970dc8a919694b27a91ae9dc08898b2b988abbef5eddfd1ae", size = 73610795, upload-time = "2025-08-06T14:57:11.513Z" },
+]
+
+[[package]]
+name = "torch-incremental-pca"
+version = "0.0.14"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
+    { name = "numpy", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "torch", version = "2.6.0+cu124", source = { registry = "https://download.pytorch.org/whl/cu124" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/07/b0/a58eb040c7adc4dbc290343a3aa6dd3044dcbf43a7cb36240cde56209416/torch_incremental_pca-0.0.14.tar.gz", hash = "sha256:63d50b9c45dbcecd1c0d29f83ae05ac9b9ba2537063239a79543c6260fde5acd", size = 5453, upload-time = "2024-12-05T12:08:20.046Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c5/8e/0e784feaa2e51915f7643f4fdd24b5aa01fa529126cd4d93b97d51843e29/torch_incremental_pca-0.0.14-py3-none-any.whl", hash = "sha256:a850237b037813a6ee358db6d4ea1f13644fbe911fd15c003b96916da5372d03", size = 5943, upload-time = "2024-12-05T12:08:18.531Z" },
 ]
 
 [[package]]

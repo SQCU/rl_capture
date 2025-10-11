@@ -576,7 +576,7 @@ class Orchestrator:
         self.config = config
         self.is_running = True
         self.shutdown_event = Event()
-        self.num_salience_workers = 2
+        self.num_salience_workers = 1   #wtf lol
         self.num_encoding_workers = 2
 
         # --- NEW: A set of specialized queues for a decoupled system ---
