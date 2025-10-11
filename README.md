@@ -7,9 +7,10 @@ This is a tool for recording gameplay sessions for machine vision and reinforcem
 ## INDEV:
 major missing features:
 
-❔ PCA decomposition (implemented, z-score estimator is like a second filter on top of the online PCA learning)
+✅ PCA decomposition (implemented, z-score estimator is like a second filter on top of the online PCA learning)
 ✅ performance-max OCR capture (who up pooling they vision tower)
-- performance-max PCA online statistics (incremental-pca is not tenable on 8-core cpus. you would need dozens of CPUs or a simd accelerator.)
+✅ performance-max PCA online statistics (incremental-pca is not tenable on 8-core cpus. you would need dozens of CPUs or a simd accelerator.)
+❔ - fix IPC resource leaks (can deadlock program then memory-lock ur entire system)
 - rewrite to use obs-studio virtual camera API for various kinds of user data hygeine (avoid ever seeing emails or directories if user alt-tabs)
 - audio capture (lol)
 - reimplement low-level-of-detail low-bitrate 'baseline recording'

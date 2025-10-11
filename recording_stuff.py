@@ -54,11 +54,11 @@ STRATEGY_CONFIGS = {
         "pca_variance_threshold": 0.95, # The variance to capture (top-p).
         "novelty_z_score_threshold": 0.65, # Z-score threshold for the Mahalanobis scores themselves.
         "branching_factor": 8, # Override the worker's default of 8
-        "min_exhaustive_size": 16, # Override the worker's default of 16
-        "max_batch_size": 16,
+        "min_exhaustive_size": 8, # Override the worker's default of 16
+        "max_batch_size": 8,
         "kernel_configs": {
             "siglip": {
-                "max_batch_size": 16 # SigLIP is efficient
+                "max_batch_size": 8 # SigLIP is efficient
             },
             "ocr": {
                 "max_batch_size": 8   # OCR model is huge, process one by one
@@ -118,23 +118,6 @@ class FrameArchiver:
         except Exception as e:
             print(f"Error saving frame at timestamp {timestamp}: {e}")
             return None
-
-@dataclass
-class MouseTrajectory:
-    """Represents a complete mouse gesture."""
-    start_time: float
-    end_time: float
-    start_pos: tuple[int, int]
-    end_pos: tuple[int, int]
-    sample_points: list[tuple[int, int]]  # Downsampled path
-    button_held: str | None  # 'left', 'right', or None for hover
-    total_distance: float
-    linearity: float  # 0.0 = very curved, 1.0 = perfectly straight
-
-import numpy as np
-from collections import deque
-from dataclasses import dataclass
-import time
 
 @dataclass
 class MouseTrajectory:
@@ -305,6 +288,25 @@ def input_capture_worker(event_queue: Queue):
     # Track which mouse buttons are currently held
     buttons_held = set()
 
+    def _emit_trajectory(traj: MouseTrajectory, queue: Queue):
+        """Helper to convert trajectory to event and emit."""
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "stream_type": "USER_INPUT",
+            "start_timestamp": traj.start_time,
+            "delta_timestamp": traj.end_time - traj.start_time,
+            "payload_json": orjson.dumps({
+                "type": "mouse_trajectory",
+                "start_pos": traj.start_pos,
+                "end_pos": traj.end_pos,
+                "sample_points": traj.sample_points,  # Downsampled path
+                "button_held": traj.button_held,
+                "total_distance": traj.total_distance,
+                "linearity": traj.linearity,
+            }).decode('utf-8')
+        }
+        queue.put(event)
+
     def on_press(key):
         if not focus_tracker.has_focus:
             return  # Silently drop
@@ -389,28 +391,11 @@ def input_capture_worker(event_queue: Queue):
         if completed_trajectory:
             _emit_trajectory(completed_trajectory, event_queue)
     
-    def _emit_trajectory(traj: MouseTrajectory, queue: Queue):
-        """Helper to convert trajectory to event and emit."""
-        event = {
-            "event_id": str(uuid.uuid4()),
-            "stream_type": "USER_INPUT",
-            "start_timestamp": traj.start_time,
-            "delta_timestamp": traj.end_time - traj.start_time,
-            "payload_json": orjson.dumps({
-                "type": "mouse_trajectory",
-                "start_pos": traj.start_pos,
-                "end_pos": traj.end_pos,
-                "sample_points": traj.sample_points,  # Downsampled path
-                "button_held": traj.button_held,
-                "total_distance": traj.total_distance,
-                "linearity": traj.linearity,
-            }).decode('utf-8')
-        }
-        queue.put(event)
+
 
     # In a real app, you would add mouse listeners as well (on_click, on_move)
     keyboard_listener = pynput.keyboard.Listener(on_press=on_press, on_release=on_release)
-    mouse_listener = pynput.mouse.Listener(on_click=on_click, on_scroll=on_scroll)
+    mouse_listener = pynput.mouse.Listener(on_click=on_click, on_move=on_move, on_scroll=on_scroll)
     keyboard_listener.start()
     mouse_listener.start()  # ← ADD THIS
     print("Input listener started.")
@@ -647,19 +632,21 @@ class Orchestrator:
         finally:
             self.shutdown()
 
+    
     def process_salience_results(self, result: dict):
         """
         Processes keyframe events and search logs from a salience worker.
+        This version has a single, robust, race-free cleanup path.
         """
         shm_name = result['shm_name']
         data = result.get('data', {})
         keyframes = data.get('keyframes', [])
         search_log = data.get('search_log', [])
 
-        # --- Now, handle the results ---
-        #print(f"Orchestrator: Received {len(keyframes)} keyframes and {len(search_log)} search log entries from {shm_name}.")
+        # We DO NOT clean up the SHM block yet.
 
-        # --- NEW: Persist the search log for a detailed timeline ---
+        # --- STEP 1: Process and persist all metadata ---
+        ##print(f"Orchestrator: Received {len(keyframes)} keyframes and {len(search_log)} search log entries from {shm_name}.")
         if search_log:
             log_event = {
                 "event_id": str(uuid.uuid4()),
@@ -670,83 +657,59 @@ class Orchestrator:
             }
             self.persistence_manager.event_queue.put(log_event)
 
-        # --- Rule Application & Video Encoding (only if keyframes were found) ---
+        # --- STEP 2: If keyframes exist, dispatch encoding jobs that need the SHM block ---
         if keyframes:
-            # --- FIX: Aggregate and merge overlapping time intervals ---
-            intervals = []
-            for event in keyframes:
-                intervals.append([event['timestamp'] - 2.0, event['timestamp'] + 2.0])
-            
-            # Sort intervals by start time
+            # Merge time intervals
+            intervals = [[event['timestamp'] - 2.0, event['timestamp'] + 2.0] for event in keyframes]
             intervals.sort(key=lambda x: x[0])
-            
             merged_intervals = []
             if intervals:
                 current_merge = intervals[0]
                 for next_interval in intervals[1:]:
-                    # If the next interval overlaps with the current one, merge them
                     if next_interval[0] <= current_merge[1]:
                         current_merge[1] = max(current_merge[1], next_interval[1])
                     else:
-                        # Otherwise, the current merge is finished. Start a new one.
                         merged_intervals.append(current_merge)
                         current_merge = next_interval
                 merged_intervals.append(current_merge)
 
-            video_encode_jobs = []
-            for start_time, end_time in merged_intervals:
-                video_encode_jobs.append({
-                    'start_time': start_time,
-                    'end_time': end_time,
-                    'quality': 'HIGH'
-                })
+            video_encode_jobs = [{'start_time': s, 'end_time': e, 'quality': 'HIGH'} for s, e in merged_intervals]
             
             if video_encode_jobs:
-                #print(f"Orchestrator: Merged {len(keyframes)} events into {len(video_encode_jobs)} encoding job(s).")
-                # We need to re-attach to the SHM to get frame data for the encoder
+                ##print(f"Orchestrator: Merged {len(keyframes)} events into {len(video_encode_jobs)} encoding job(s).")
                 try:
+                    # Open the SHM block for reading. This should now succeed.
                     shm = shared_memory.SharedMemory(name=shm_name)
-                    shape = result['shape']
-                    timestamps = result['timestamps']
-                    buffer = np.ndarray(shape, dtype=result['dtype'], buffer=shm.buf)
+                    buffer = np.ndarray(result['shape'], dtype=result['dtype'], buffer=shm.buf)
+                    timestamps = np.array(result['timestamps'])
                     
-                    # For now, process each job separately. Could be optimized.
+                    # Dispatch frames to the encoder
                     for job in video_encode_jobs:
-                        mask = (np.array(timestamps) >= job['start_time']) & (np.array(timestamps) <= job['end_time'])
+                        mask = (timestamps >= job['start_time']) & (timestamps <= job['end_time'])
                         indices = np.where(mask)[0]
                         if len(indices) > 0:
-                            sorted_indices = sorted(indices, key=lambda i: timestamps[i])
-                            frames_to_encode = buffer[sorted_indices]
-                            timestamps_to_encode = np.array(timestamps)[sorted_indices]
-                            
+                            frames_to_encode = buffer[indices]
+                            timestamps_to_encode = timestamps[indices]
                             self.encoding_task_queue.put({
                                 'frames': frames_to_encode,
                                 'timestamps': timestamps_to_encode,
                                 'quality': job['quality'],
                             })
+                    # We are done READING. Close our handle.
                     shm.close()
-
                 except FileNotFoundError:
                     pass
-                    #print(f"WARNING: Could not find SHM block {shm_name} for encoding. It may have been cleaned up already.")
+                    ##print(f"WARNING: Could not find SHM block {shm_name} for encoding. This might be a shutdown race condition.")
 
-            # --- Cleanup ---
-            # The salience worker is done, and we have dispatched encoding.
-            # Now we can release our handle and unlink the memory.
-            shm_to_clean = self.active_shm_blocks.pop(shm_name, None)
-            if shm_to_clean:
-                shm_to_clean.close()
-                shm_to_clean.unlink()
-                #print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
-            else:
-                #print(f"Orchestrator WARNING: Tried to clean up {shm_name}, but it was not in our active registry.")
-                # As a fallback, try to unlink it anyway in case of a state mismatch
-                try:
-                    shm_fallback = shared_memory.SharedMemory(name=shm_name)
-                    shm_fallback.close()
-                    shm_fallback.unlink()
-                except FileNotFoundError:
-                    pass 
+        # --- STEP 3: The block has served all purposes. Now, and only now, destroy it. ---
+        shm_to_clean = self.active_shm_blocks.pop(shm_name, None)
+        if shm_to_clean:
+            shm_to_clean.close()
+            shm_to_clean.unlink()
+            ##print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
+        else:
+            pass
+            ##print(f"Orchestrator WARNING: Worker reported on {shm_name}, but it was not in our active registry.")
 
     def start_workers(self):
         """Creates and starts all the decoupled processes and threads."""

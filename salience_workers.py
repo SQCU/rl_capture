@@ -350,7 +350,7 @@ class HierarchicalSearchManager:
         search_queue = deque([(0, len(frames_chunk) - 1, 1)])
         final_events, search_log = [], []
 
-        with tqdm(total=len(frames_chunk), desc=f"[{self.worker_id}] Search", unit="frame", position=0, disable=True) as pbar:
+        with tqdm(total=len(frames_chunk), desc=f"[{self.worker_id}] Search", unit="frame", position=0) as pbar:
             while search_queue:
                 if shutdown_event.is_set(): break
                 start_idx, end_idx, depth = search_queue.popleft()
@@ -437,6 +437,20 @@ def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown
         except Exception as e:
            #print(f"[{worker_pid}] CRITICAL ERROR in worker loop: {e}")
             import traceback; traceback.print_exc()
+            if 'task' in locals() and task:
+                failure_message = {
+                    "shm_name": task['shm_name'],
+                    "shape": task.get('shape'), # Include what we can
+                    "dtype": task.get('dtype'),
+                    "timestamps": task.get('timestamps'),
+                    "source": "HierarchicalSearchManager",
+                    "data": {"error": str(e)} # Signal that this was a failure
+                }
+                return_queue.put(failure_message)
+                
+                # Ensure we don't hold a dangling reference to the failed SHM
+                if 'shm' in locals() and shm:
+                    shm.close()
             
    #print(f"[{worker_pid}] Analysis worker finished.")
 
