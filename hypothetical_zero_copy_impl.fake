@@ -1,0 +1,76 @@
+// hypothetical_zero_copy_impl.fake
+// obs-studio/plugins/zeromq-ipc/zeromq-ipc.cpp
+
+#include <obs-module.h>
+#include <zmq.h>
+
+struct zeromq_output {
+    obs_output_t *output;
+    void *zmq_context;
+    void *zmq_publisher;
+    obs_shm_t *shared_buffer;  // OBS's shared memory type
+};
+
+static void zeromq_output_raw_video(void *data, struct video_data *frame) {
+    struct zeromq_output *output = data;
+    
+    // Zero-copy: Just send shm handle + metadata
+    zmq_msg_t msg;
+    zmq_msg_init_size(&msg, sizeof(frame_metadata));
+    
+    frame_metadata *meta = zmq_msg_data(&msg);
+    meta->shm_handle = obs_shm_get_handle(output->shared_buffer);
+    meta->timestamp = frame->timestamp;
+    meta->width = frame->width;
+    meta->height = frame->height;
+    
+    zmq_msg_send(&msg, output->zmq_publisher, 0);
+    zmq_msg_close(&msg);
+}
+
+// Register as OBS output plugin
+OBS_DECLARE_MODULE()
+
+"""
+# your_ml_tool/obs_consumer.py (MIT License - YOUR code)
+
+import zmq
+import numpy as np
+from multiprocessing import shared_memory
+
+class OBSZeroMQConsumer:
+    
+    #Consumes zero-copy frames from OBS via ZeroMQ IPC.
+    #It's a separate application reading from an IPC stream.
+    
+    def __init__(self, zmq_endpoint="ipc:///tmp/obs-frames"):
+        self.context = zmq.Context()
+        self.subscriber = self.context.socket(zmq.SUB)
+        self.subscriber.connect(zmq_endpoint)
+        self.subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+    
+    def get_frame(self) -> np.ndarray:
+        # Receive metadata
+        msg = self.subscriber.recv()
+        meta = parse_metadata(msg)
+        
+        # Attach to shared memory (zero-copy)
+        shm = shared_memory.SharedMemory(name=meta.shm_handle)
+        frame = np.ndarray(
+            shape=(meta.height, meta.width, 3),
+            dtype=np.uint8,
+            buffer=shm.buf
+        )
+        
+        return frame.copy()  # Copy if you need to persist it
+    
+    def close(self):
+        self.subscriber.close()
+        self.context.term()
+
+# Usage in your MIT-licensed tool
+consumer = OBSZeroMQConsumer()
+while True:
+    frame = consumer.get_frame()
+    salience_score = analyze_frame(frame)  # Your MIT code
+"""

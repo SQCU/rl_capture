@@ -31,6 +31,9 @@ CAPTURE_REGION = None
 OUTPUT_PATH = f"./capture_run_{int(time.time())}"
 CHUNK_SECONDS = 5  # How many seconds of frames to triage at a time
 CAPTURE_FPS = 30
+UNHANDLED_SHM_DEADLINE_SECONDS = 75.0 # Time before we declare a block abandoned
+MAX_PIPELINE_DEPTH = 15
+MIN_PIPELINE_DEPTH = 5
 # --- NEW: Triage Configuration ---
 TRIAGE_THRESHOLD = 0.1 # A starting point for max_delta to trigger deep analysis
 
@@ -276,19 +279,130 @@ class MouseTrajectoryTracker:
         return trajectory
     
     def force_finalize(self) -> MouseTrajectory | None:
-        """Call this on shutdown or focus loss to flush the current trajectory."""
-        return self._finalize_trajectory()
+        """
+        Call this on shutdown or focus loss to flush the current trajectory
+        and reset the tracker's state.
+        """
+        # --- FIX: Finalize and then explicitly reset the tracker's state ---
+        completed_trajectory = self._finalize_trajectory()
+        
+        # Reset state to prevent re-firing with stale data
+        self.current_trajectory = []
+        self.trajectory_start_time = None
+        self.last_position = None
+        self.last_motion_time = None
+        
+        return completed_trajectory
+
+@dataclass
+class ScrollTrajectory:
+    """Represents a complete scroll gesture."""
+    start_time: float
+    end_time: float
+    total_dx: int
+    total_dy: int
+    reversals: int # How many times the scroll direction changed
+    duration: float
+
+class ScrollTrajectoryTracker:
+    """
+    Buffers scroll events and emits a trajectory when the user stops scrolling.
+    This turns a high-frequency stream of scroll ticks into a single,
+    semantically meaningful event.
+    """
+    def __init__(self, timeout: float = 0.3):
+        """
+        Args:
+            timeout: Time in seconds of no scrolling to consider the gesture complete.
+        """
+        self.timeout = timeout
+        
+        # State for the current trajectory
+        self.start_time = None
+        self.last_scroll_time = None
+        self.total_dx = 0
+        self.total_dy = 0
+        self.history_dy = []
+
+    def on_scroll(self, dx: int, dy: int) -> ScrollTrajectory | None:
+        """
+        Processes a single scroll tick. Returns a completed trajectory if a
+        new gesture is starting after a pause, otherwise None.
+        """
+        current_time = time.time()
+        completed_trajectory = None
+
+        # If a scroll gesture was active but has timed out, finalize it.
+        if self.start_time and (current_time - self.last_scroll_time > self.timeout):
+            completed_trajectory = self._finalize_trajectory()
+            self._reset()
+
+            # --- ADD THIS GUARD ---
+        if dx == 0 and dy == 0: # This is a dummy event just to check for timeouts
+            return completed_trajectory
+
+        # Start a new trajectory if one isn't active
+        if not self.start_time:
+            self.start_time = current_time
+        
+        # Update the current trajectory's state
+        self.last_scroll_time = current_time
+        self.total_dx += dx
+        self.total_dy += dy
+        self.history_dy.append(dy)
+
+        return completed_trajectory
+
+    def _finalize_trajectory(self) -> ScrollTrajectory | None:
+        """Analyzes the buffered scroll data and creates a trajectory event."""
+        if self.start_time is None:
+            return None
+
+        # Analyze history for direction reversals (e.g., overshot and corrected)
+        reversals = 0
+        if len(self.history_dy) > 1:
+            # Get the signs of each scroll tick (+1 for up, -1 for down)
+            signs = np.sign(self.history_dy)
+            # Find where the sign changes
+            sign_changes = np.diff(signs)
+            # Count non-zero changes
+            reversals = np.count_nonzero(sign_changes)
+
+        trajectory = ScrollTrajectory(
+            start_time=self.start_time,
+            end_time=self.last_scroll_time,
+            total_dx=self.total_dx,
+            total_dy=self.total_dy,
+            reversals=reversals,
+            duration=self.last_scroll_time - self.start_time
+        )
+        return trajectory
+
+    def _reset(self):
+        """Resets the state to prepare for the next gesture."""
+        self.start_time = None
+        self.last_scroll_time = None
+        self.total_dx = 0
+        self.total_dy = 0
+        self.history_dy = []
+
+    def force_finalize(self) -> ScrollTrajectory | None:
+        """Called on shutdown or focus loss to flush any pending scroll gesture."""
+        completed = self._finalize_trajectory()
+        self._reset()
+        return completed
 
 def input_capture_worker(event_queue: Queue):
     """Listens for keyboard and mouse events and puts them on the event queue."""
     key_states = {} # Tracks the start time of key presses
     focus_tracker = FocusTracker(RECORDING_WINDOW_NAME)
     trajectory_tracker = MouseTrajectoryTracker(sample_interval=0.0083)  # 120Hz sampling
+    scroll_tracker = ScrollTrajectoryTracker(timeout=0.3)
 
     # Track which mouse buttons are currently held
     buttons_held = set()
 
-    def _emit_trajectory(traj: MouseTrajectory, queue: Queue):
+    def _emit_mouse_trajectory(traj: MouseTrajectory, queue: Queue):
         """Helper to convert trajectory to event and emit."""
         event = {
             "event_id": str(uuid.uuid4()),
@@ -301,8 +415,24 @@ def input_capture_worker(event_queue: Queue):
                 "end_pos": traj.end_pos,
                 "sample_points": traj.sample_points,  # Downsampled path
                 "button_held": traj.button_held,
-                "total_distance": traj.total_distance,
-                "linearity": traj.linearity,
+                "total_distance": float(traj.total_distance),
+                "linearity": float(traj.linearity),
+            }).decode('utf-8')
+        }
+        queue.put(event)
+
+    def _emit_scroll_trajectory(traj: ScrollTrajectory, queue: Queue):
+        """Helper to convert scroll trajectory to event and emit."""
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "stream_type": "USER_INPUT",
+            "start_timestamp": traj.start_time,
+            "delta_timestamp": traj.duration,
+            "payload_json": orjson.dumps({
+                "type": "scroll_trajectory",
+                "total_dx": traj.total_dx,
+                "total_dy": traj.total_dy,
+                "reversals": traj.reversals,
             }).decode('utf-8')
         }
         queue.put(event)
@@ -356,30 +486,30 @@ def input_capture_worker(event_queue: Queue):
     def on_scroll(x, y, dx, dy):
         """Logs mouse scroll events."""
         if not focus_tracker.has_focus:
-            return  # Silently drop
+            # Finalize any pending gesture on focus loss
+            completed_scroll = scroll_tracker.force_finalize()
+            if completed_scroll:
+                _emit_scroll_trajectory(completed_scroll, event_queue)
+            return
         
-        event = {
-            "event_id": str(uuid.uuid4()),
-            "stream_type": "USER_INPUT",
-            "start_timestamp": time.time(),
-            "delta_timestamp": 0.0,
-            "payload_json": orjson.dumps({
-                "type": "mouse_scroll",
-                "x": x,
-                "y": y,
-                "dx": dx,
-                "dy": dy
-            }).decode('utf-8')
-        }
-        event_queue.put(event)
+        # The tracker may return a completed trajectory from the *previous* gesture
+        completed_scroll = scroll_tracker.on_scroll(dx, dy)
+        if completed_scroll:
+            _emit_scroll_trajectory(completed_scroll, event_queue)
 
     def on_move(x, y):
+        # --- FIX: Add a periodic check for timed-out scroll gestures ---
+        # This is a good place because on_move fires frequently.
+        timed_out_scroll = scroll_tracker.on_scroll(0, 0) # Sending a dummy event triggers the timeout check
+        if timed_out_scroll:
+            _emit_scroll_trajectory(timed_out_scroll, event_queue)
+
         if not focus_tracker.has_focus:
             # If we lose focus during a trajectory, finalize it
             if trajectory_tracker.trajectory_start_time is not None:
                 completed_trajectory = trajectory_tracker.force_finalize()
                 if completed_trajectory:
-                    _emit_trajectory(completed_trajectory, event_queue)
+                    _emit_mouse_trajectory(completed_trajectory, event_queue)
             return
         
         # Determine current button state
@@ -389,10 +519,8 @@ def input_capture_worker(event_queue: Queue):
         completed_trajectory = trajectory_tracker.on_move(x, y, current_button)
         
         if completed_trajectory:
-            _emit_trajectory(completed_trajectory, event_queue)
+            _emit_mouse_trajectory(completed_trajectory, event_queue)
     
-
-
     # In a real app, you would add mouse listeners as well (on_click, on_move)
     keyboard_listener = pynput.keyboard.Listener(on_press=on_press, on_release=on_release)
     mouse_listener = pynput.mouse.Listener(on_click=on_click, on_move=on_move, on_scroll=on_scroll)
@@ -583,9 +711,13 @@ class Orchestrator:
         
         # --- MODIFIED: This dictionary will now hold active SHM handles ---
         self.active_shm_blocks = {} # {shm_name: shm_instance}
+        self.shm_lock = Lock()
+        self.max_pipeline_depth = MAX_PIPELINE_DEPTH # Max number of concurrent SHM blocks
+        self.min_pipeline_depth = MIN_PIPELINE_DEPTH  # Target to shrink back towards
         
         # High-level components
         self.persistence_manager = AsyncPersistenceManager(config['output_path'], Queue()) # Give it its own queue
+        self.guardian_thread = Thread(target=self._guardian_loop, daemon=True)
         self.frame_archiver = FrameArchiver(config['output_path'])
         self.video_encoder = VideoEncoder(config['output_path'])
         
@@ -596,120 +728,175 @@ class Orchestrator:
         """Starts all worker processes and the main orchestration loop."""
         self.start_workers()
         self.persistence_manager.start()
+        self.guardian_thread.start() # Start the guardian
         
         print("Starting main orchestration loop... Press Ctrl+C to stop.")
         try:
             while self.is_running:
                 # --- Main Orchestration Loop ---
-                # This loop is now very simple and fast.
-
-                # --- NEW: Check for and claim new SHM blocks ---
-                if not self.shm_notification_queue.empty():
-                    shm_name = self.shm_notification_queue.get_nowait()
-                    try:
-                        # Open our own handle to the SHM block, keeping it alive.
-                        shm = shared_memory.SharedMemory(name=shm_name)
-                        self.active_shm_blocks[shm_name] = shm
-                        #print(f"Orchestrator: Registered and claimed SHM block {shm_name}.")
-                    except FileNotFoundError:
-                        print(f"Orchestrator WARNING: Triage notified of {shm_name}, but it disappeared before we could claim it.")
-
-                # 1. Check for results from salience workers
-                if not self.salience_results_queue.empty():
-                    result = self.salience_results_queue.get_nowait()
-                    self.process_salience_results(result)
-
-                # 2. Check for completed video encodes
-                if not self.encoding_results_queue.empty():
-                    result = self.encoding_results_queue.get_nowait()
-                    #print(f"Orchestrator: Confirmed completion of encode job.")
-                    # In a more complex system, you might log this completion.
+                # 1. Claim new SHM blocks from the Dispatcher
+                self.claim_new_shm_blocks()
+                # 2. Process results from salience workers
+                self.process_salience_results_queue()
+                # 3. Check for completed video encodes
+                self.process_encoding_results_queue()
+                # 4. NEW: Audit active SHM blocks for timeouts
+                self.audit_shm_blocks()
+                # 5. NEW: Adjust pipeline parameters based on load
+                self.adapt_pipeline()
                 
-                time.sleep(0.05)
+                time.sleep(0.012)
 
         except (KeyboardInterrupt, SystemExit):
             self.is_running = False
         finally:
             self.shutdown()
-
     
-    def process_salience_results(self, result: dict):
+    def process_salience_results_queue(self):
         """
         Processes keyframe events and search logs from a salience worker.
         This version has a single, robust, race-free cleanup path.
         """
-        shm_name = result['shm_name']
-        data = result.get('data', {})
-        keyframes = data.get('keyframes', [])
-        search_log = data.get('search_log', [])
+        while not self.salience_results_queue.empty():
+            result = self.salience_results_queue.get_nowait()
+            shm_name = result['shm_name']
 
-        # We DO NOT clean up the SHM block yet.
+            # --- MODIFICATION: Update status before processing ---
+            with self.shm_lock:
+                if shm_name in self.active_shm_blocks:
+                    self.active_shm_blocks[shm_name]['status'] = 'encoding_pending'
+                else:
+                    # This can happen if the block timed out and was already cleaned up
+                    print(f"Orchestrator: Received result for {shm_name}, but it's no longer active. Discarding.")
+                    continue
 
-        # --- STEP 1: Process and persist all metadata ---
-        ##print(f"Orchestrator: Received {len(keyframes)} keyframes and {len(search_log)} search log entries from {shm_name}.")
-        if search_log:
-            log_event = {
-                "event_id": str(uuid.uuid4()),
-                "stream_type": "SALIENCE_SEARCH_LOG",
-                "start_timestamp": result['timestamps'][0],
-                "delta_timestamp": result['timestamps'][-1] - result['timestamps'][0],
-                "payload_json": orjson.dumps({'shm_name': shm_name, 'log': search_log}).decode('utf-8')
-            }
-            self.persistence_manager.event_queue.put(log_event)
+            shm_name = result['shm_name']
+            data = result.get('data', {})
+            keyframes = data.get('keyframes', [])
+            search_log = data.get('search_log', [])
 
-        # --- STEP 2: If keyframes exist, dispatch encoding jobs that need the SHM block ---
-        if keyframes:
-            # Merge time intervals
-            intervals = [[event['timestamp'] - 2.0, event['timestamp'] + 2.0] for event in keyframes]
-            intervals.sort(key=lambda x: x[0])
-            merged_intervals = []
-            if intervals:
-                current_merge = intervals[0]
-                for next_interval in intervals[1:]:
-                    if next_interval[0] <= current_merge[1]:
-                        current_merge[1] = max(current_merge[1], next_interval[1])
-                    else:
-                        merged_intervals.append(current_merge)
-                        current_merge = next_interval
-                merged_intervals.append(current_merge)
+            # We DO NOT clean up the SHM block yet.
 
-            video_encode_jobs = [{'start_time': s, 'end_time': e, 'quality': 'HIGH'} for s, e in merged_intervals]
-            
-            if video_encode_jobs:
-                ##print(f"Orchestrator: Merged {len(keyframes)} events into {len(video_encode_jobs)} encoding job(s).")
-                try:
-                    # Open the SHM block for reading. This should now succeed.
-                    shm = shared_memory.SharedMemory(name=shm_name)
-                    buffer = np.ndarray(result['shape'], dtype=result['dtype'], buffer=shm.buf)
-                    timestamps = np.array(result['timestamps'])
-                    
-                    # Dispatch frames to the encoder
-                    for job in video_encode_jobs:
-                        mask = (timestamps >= job['start_time']) & (timestamps <= job['end_time'])
-                        indices = np.where(mask)[0]
-                        if len(indices) > 0:
-                            frames_to_encode = buffer[indices]
-                            timestamps_to_encode = timestamps[indices]
-                            self.encoding_task_queue.put({
-                                'frames': frames_to_encode,
-                                'timestamps': timestamps_to_encode,
-                                'quality': job['quality'],
-                            })
-                    # We are done READING. Close our handle.
-                    shm.close()
-                except FileNotFoundError:
-                    pass
-                    ##print(f"WARNING: Could not find SHM block {shm_name} for encoding. This might be a shutdown race condition.")
+            # --- STEP 1: Process and persist all metadata ---
+            ##print(f"Orchestrator: Received {len(keyframes)} keyframes and {len(search_log)} search log entries from {shm_name}.")
+            if search_log:
+                log_event = {
+                    "event_id": str(uuid.uuid4()),
+                    "stream_type": "SALIENCE_SEARCH_LOG",
+                    "start_timestamp": result['timestamps'][0],
+                    "delta_timestamp": result['timestamps'][-1] - result['timestamps'][0],
+                    "payload_json": orjson.dumps({'shm_name': shm_name, 'log': search_log}).decode('utf-8')
+                }
+                self.persistence_manager.event_queue.put(log_event)
 
-        # --- STEP 3: The block has served all purposes. Now, and only now, destroy it. ---
-        shm_to_clean = self.active_shm_blocks.pop(shm_name, None)
-        if shm_to_clean:
-            shm_to_clean.close()
-            shm_to_clean.unlink()
-            ##print(f"Orchestrator: Cleaned up SHM block {shm_name}.")
-        else:
-            pass
-            ##print(f"Orchestrator WARNING: Worker reported on {shm_name}, but it was not in our active registry.")
+            # --- STEP 2: If keyframes exist, dispatch encoding jobs that need the SHM block ---
+            if keyframes:
+                # Merge time intervals
+                intervals = [[event['timestamp'] - 2.0, event['timestamp'] + 2.0] for event in keyframes]
+                intervals.sort(key=lambda x: x[0])
+                merged_intervals = []
+                if intervals:
+                    current_merge = intervals[0]
+                    for next_interval in intervals[1:]:
+                        if next_interval[0] <= current_merge[1]:
+                            current_merge[1] = max(current_merge[1], next_interval[1])
+                        else:
+                            merged_intervals.append(current_merge)
+                            current_merge = next_interval
+                    merged_intervals.append(current_merge)
+
+                video_encode_jobs = [{'start_time': s, 'end_time': e, 'quality': 'HIGH'} for s, e in merged_intervals]
+                
+                if video_encode_jobs:
+                    ##print(f"Orchestrator: Merged {len(keyframes)} events into {len(video_encode_jobs)} encoding job(s).")
+                    try:
+                        # Open the SHM block for reading. This should now succeed.
+                        shm = shared_memory.SharedMemory(name=shm_name)
+                        buffer = np.ndarray(result['shape'], dtype=result['dtype'], buffer=shm.buf)
+                        timestamps = np.array(result['timestamps'])
+                        
+                        # Dispatch frames to the encoder
+                        for job in video_encode_jobs:
+                            mask = (timestamps >= job['start_time']) & (timestamps <= job['end_time'])
+                            indices = np.where(mask)[0]
+                            if len(indices) > 0:
+                                frames_to_encode = buffer[indices]
+                                timestamps_to_encode = timestamps[indices]
+                                self.encoding_task_queue.put({
+                                    'frames': frames_to_encode,
+                                    'timestamps': timestamps_to_encode,
+                                    'quality': job['quality'],
+                                })
+                        # We are done READING. Close our handle.
+                        shm.close()
+                    except FileNotFoundError:
+                        pass
+                        ##print(f"WARNING: Could not find SHM block {shm_name} for encoding. This might be a shutdown race condition.")
+
+            # --- FINAL STEP: The block has served all purposes. Destroy it. ---
+            self.cleanup_shm_block(shm_name)
+
+    # --- FIX: Add the missing method definition here ---
+    def process_encoding_results_queue(self):
+        """Checks for and logs completed video encoding jobs."""
+        while not self.encoding_results_queue.empty():
+            result = self.encoding_results_queue.get_nowait()
+            # In a more complex system, you might log this completion.
+            # For now, just confirming it's done is enough.
+            print(f"Orchestrator: Confirmed completion of encode job.")
+
+    def claim_new_shm_blocks(self):
+        """Claims new SHM blocks announced by the Dispatcher."""
+        while not self.shm_notification_queue.empty():
+            shm_name = self.shm_notification_queue.get_nowait()
+            try:
+                shm = shared_memory.SharedMemory(name=shm_name)
+                with self.shm_lock:
+                    self.active_shm_blocks[shm_name] = {
+                        "shm": shm,
+                        "timestamp": time.time(),
+                        "status": "pending_analysis" 
+                    }
+            except FileNotFoundError:
+                print(f"Orchestrator WARNING: Notified of {shm_name}, but it disappeared.")
+
+    def audit_shm_blocks(self):
+        """Finds and cleans up abandoned SHM blocks."""
+        now = time.time()
+        abandoned_blocks = []
+        with self.shm_lock:
+            for name, meta in self.active_shm_blocks.items():
+                if (now - meta['timestamp']) > UNHANDLED_SHM_DEADLINE_SECONDS:
+                    print(f"Orchestrator: SHM block {name} has been unhandled for too long. Declaring abandoned.")
+                    abandoned_blocks.append(name)
+        
+        for name in abandoned_blocks:
+            self.cleanup_shm_block(name)
+
+    def cleanup_shm_block(self, name: str):
+        """Safely closes, unlinks, and removes an SHM block from tracking."""
+        with self.shm_lock:
+            if name in self.active_shm_blocks:
+                meta = self.active_shm_blocks.pop(name)
+                meta['shm'].close()
+                meta['shm'].unlink()
+                print(f"Orchestrator: Cleaned up SHM block {name}.")
+
+    def adapt_pipeline(self):
+        """Dynamically adjusts capture parameters based on processing load."""
+        with self.shm_lock:
+            pipeline_depth = len(self.active_shm_blocks)
+
+        if pipeline_depth > self.max_pipeline_depth:
+            # We are backlogged. Increase chunk size to reduce analysis overhead per second of video.
+            if self.config['chunk_seconds'] < 15:
+                self.config['chunk_seconds'] += 1
+                print(f"PIPELINE BACKLOG DETECTED (depth: {pipeline_depth}). Increasing chunk size to {self.config['chunk_seconds']}s.")
+        elif pipeline_depth < self.min_pipeline_depth:
+            # We have spare capacity. Decrease chunk size for lower latency.
+             if self.config['chunk_seconds'] > 5:
+                self.config['chunk_seconds'] -= 1
+                print(f"PIPELINE CAPACITY AVAILABLE (depth: {pipeline_depth}). Decreasing chunk size to {self.config['chunk_seconds']}s.")
 
     def start_workers(self):
         """Creates and starts all the decoupled processes and threads."""
@@ -738,6 +925,34 @@ class Orchestrator:
         self.threads.append(input_thread)
         input_thread.start()
 
+    def _guardian_loop(self):
+        """Monitors system resources and takes emergency action."""
+        print("Guardian thread started. Monitoring system RAM.")
+        while self.is_running:
+            mem_percent = psutil.virtual_memory().percent
+            
+            if mem_percent > 95.0:
+                print(f"CRITICAL: System memory at {mem_percent}%. Forcing immediate shutdown.")
+                # This is the most drastic action. os._exit bypasses all cleanup.
+                # In a real-world app, you might use a wrapper script to restart.
+                os._exit(1)
+
+            elif mem_percent > 90.0:
+                print(f"WARNING: System memory at {mem_percent}%. Shedding pending analysis tasks.")
+                blocks_to_drop = []
+                with self.shm_lock:
+                    for name, meta in self.active_shm_blocks.items():
+                        # Only drop blocks that haven't even started analysis yet.
+                        if meta['status'] == 'pending_analysis':
+                            blocks_to_drop.append(name)
+                
+                if blocks_to_drop:
+                    print(f"Guardian shedding {len(blocks_to_drop)} SHM blocks to free memory.")
+                    for name in blocks_to_drop:
+                        self.cleanup_shm_block(name)
+            
+            time.sleep(2) # Check every 2 seconds
+
     def shutdown(self):
         print("\nShutting down orchestrator...")
         if not self.is_running: return
@@ -759,10 +974,10 @@ class Orchestrator:
         self.video_encoder.shutdown_all()
         self.persistence_manager.shutdown()
         print("-> Cleaning up any orphaned SHM blocks...")
-        for name, shm in self.active_shm_blocks.items():
-            print(f"   - Cleaning {name}")
-            shm.close()
-            shm.unlink()
+        with self.shm_lock:
+            all_names = list(self.active_shm_blocks.keys())
+        for name in all_names:
+            self.cleanup_shm_block(name)
         print("-> Shutdown complete.")
 
 # =====================================================================================
