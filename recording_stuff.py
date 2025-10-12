@@ -26,14 +26,15 @@ import salience_workers as sal_wo
 from window_utils import get_window_finder, WindowNotFoundError
 
 # --- Configuration ---
-RECORDING_WINDOW_NAME = "ToramOnline"
+RECORDING_WINDOW_NAME = "ATLYSS"
 CAPTURE_REGION = None
 OUTPUT_PATH = f"./capture_run_{int(time.time())}"
-CHUNK_SECONDS = 5  # How many seconds of frames to triage at a time
+CHUNK_SECONDS = 10  # How many seconds of frames to triage at a time
 CAPTURE_FPS = 30
 UNHANDLED_SHM_DEADLINE_SECONDS = 75.0 # Time before we declare a block abandoned
 MAX_PIPELINE_DEPTH = 15
 MIN_PIPELINE_DEPTH = 5
+KEYFRAME_PADDING_SECONDS = 0.5 # How many seconds before and after a keyframe to include in a clip
 # --- NEW: Triage Configuration ---
 TRIAGE_THRESHOLD = 0.1 # A starting point for max_delta to trigger deep analysis
 
@@ -51,14 +52,21 @@ STRATEGY_CONFIGS = {
         "branching_factor": 8, # Override the worker's default of 8
         "min_exhaustive_size": 16, # Override the worker's default of 16 
         "max_batch_size": 16,
+        "optimistic_top_k": 1,       # How many of the "most interesting" non-novel branches to explore.
+        "optimistic_max_depth": 1,   # How many consecutive optimistic steps are allowed before a branch must prove its novelty.
     },
     "pca_mahalanobis": {
         "pca_n_components": 16,      # Max components (top-k guardrail).
         "pca_variance_threshold": 0.95, # The variance to capture (top-p).
-        "novelty_z_score_threshold": 0.65, # Z-score threshold for the Mahalanobis scores themselves.
+        "novelty_z_score_threshold": 0.5, # Z-score threshold for the Mahalanobis scores themselves.
         "branching_factor": 8, # Override the worker's default of 8
         "min_exhaustive_size": 8, # Override the worker's default of 16
         "max_batch_size": 8,
+        "top_k": 3,          # Explore the top 2 sub-spans in a "hot" region.
+        "max_d": 3,          # Max recursion depth for "hot" regions.
+        "top_k_lazy": 1,     # Explore only the top sub-span in a "cold" region.
+        "max_d_lazy": 1,     # Give up on "cold" regions faster.
+        "max_p": 0.33,       # Hard budget: process at most 33% of total frames in a chunk.
         "kernel_configs": {
             "siglip": {
                 "max_batch_size": 8 # SigLIP is efficient
@@ -373,7 +381,7 @@ class ScrollTrajectoryTracker:
             end_time=self.last_scroll_time,
             total_dx=self.total_dx,
             total_dy=self.total_dy,
-            reversals=reversals,
+            reversals=int(reversals),
             duration=self.last_scroll_time - self.start_time
         )
         return trajectory
@@ -391,6 +399,142 @@ class ScrollTrajectoryTracker:
         completed = self._finalize_trajectory()
         self._reset()
         return completed
+
+
+class VideoEncoder:
+    """
+    Manages ffmpeg subprocesses for encoding video clips from raw frames.
+    """
+    def __init__(self, output_path: str):
+        self.output_path = output_path
+        os.makedirs(os.path.join(self.output_path, "videos"), exist_ok=True)
+        self.active_processes = [] # Keep track of all processes
+        self.lock = Lock() # To safely append to the list from multiple workers
+
+
+    def start_encode_slice(self, frames: np.ndarray, timestamps: np.ndarray, quality: str) -> subprocess.Popen:
+        """
+        Launches an ffmpeg process asynchronously to encode a set of frames.
+        
+        Args:
+            frames: A numpy array of shape (N, H, W, 3) with RGB frame data.
+            timestamps: A numpy array of shape (N,) with the timestamp for each frame.
+            quality: A string ('HIGH' or 'LOW') to determine encoding parameters.
+        
+        Returns:
+            A Popen object representing the running ffmpeg process.
+        """
+        if len(frames) == 0:
+            return None
+
+        # Calculate a stable framerate for the clip
+        durations = np.diff(timestamps)
+        avg_fps = 1.0 / np.mean(durations) if len(durations) > 0 else 30.0
+        
+        height, width, _ = frames[0].shape
+        output_filename = f"clip_{timestamps[0]:.2f}_{quality.lower()}.mp4"
+        output_filepath = os.path.join(self.output_path, "videos", output_filename)
+
+        # --- FIX: Build a video filter chain to ensure even dimensions ---
+        filter_chain = ["crop=trunc(iw/2)*2:trunc(ih/2)*2"]
+
+        if quality == 'HIGH':
+            crf = 20
+            preset = 'fast'
+        else: # VERY_LOW
+            crf = 35
+            preset = 'ultrafast'
+            # Also ensure the downscaled resolution is even
+            out_w = (width // 4) - ((width // 4) % 2)
+            out_h = (height // 4) - ((height // 4) % 2)
+            filter_chain.append(f"scale={out_w}:{out_h}")
+
+        command = [
+            'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}', '-pix_fmt', 'rgb24', '-r', str(avg_fps),
+            '-i', '-', '-c:v', 'libx264', '-preset', preset, '-crf', str(crf),
+            '-vf', ",".join(filter_chain), # Apply the filter chain
+            '-pix_fmt', 'yuv420p', output_filepath,
+        ]
+        # --- END FIX ---
+
+        # Start the process with stdin piped
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        ps_proc = psutil.Process(proc.pid)
+
+        ps_proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS) # For Windows
+        # ps_p.nice(10) # For Linux (higher number is lower priority)
+
+        with self.lock:
+            self.active_processes.append(proc)
+        
+        # Write all frame data to the pipe in a separate thread to avoid blocking
+        def pipe_frames():
+            try:
+                contiguous_frames = np.ascontiguousarray(frames)
+                proc.stdin.write(contiguous_frames.tobytes())
+            except (IOError, BrokenPipeError):
+                print(f"Warning: ffmpeg pipe broke for {output_filename}. The process may have terminated early.")
+            finally:
+                proc.stdin.close()
+        
+        Thread(target=pipe_frames).start()
+        
+        print(f"Started encoding {output_filename}...")
+        return proc
+
+    def start_continuous_encode(self, dimensions: tuple, fps: int) -> (subprocess.Popen, io.BufferedWriter):
+        """
+        Launches a persistent ffmpeg process for a continuous, low-quality recording.
+        
+        Returns:
+            A tuple containing the Popen object and its stdin pipe.
+        """
+        height, width, _ = dimensions
+        output_filename = f"baseline_record_{time.time():.0f}.mp4"
+        output_filepath = os.path.join(self.output_path, "videos", output_filename)
+
+        # A very low quality but fast configuration for the baseline
+        crf = 38  # Higher CRF is lower quality, smaller file. 38 is quite low.
+        preset = 'ultrafast' # Prioritize low CPU usage
+        # Downscale to a 'potato quality' resolution like 480p
+        height_out = 480
+        width_out = int(width * (height_out / height))
+        if width_out % 2 != 0: width_out += 1 # Ensure final width is even
+
+        # The crop filter runs first on the input, then the scale filter runs on the result.
+        filter_chain = [
+            "crop=trunc(iw/2)*2:trunc(ih/2)*2",
+            f"scale={width_out}:{height_out}"
+        ]
+
+        command = [
+            'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+            '-s', f'{width_out}x{height_out}', '-pix_fmt', 'rgb24', '-r', str(fps),
+            '-i', '-', '-an', '-c:v', 'libx264', '-preset', preset, '-crf', str(crf),
+            '-vf', ",".join(filter_chain), # Apply the filter chain
+            '-pix_fmt', 'yuv420p', output_filepath,
+        ]
+
+        print(f"Starting continuous baseline recording to {output_filepath} at {width_out}:{height_out}...")
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        
+        # Set low priority to not interfere with the game or capture
+        ps_proc = psutil.Process(proc.pid)
+        ps_proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS) # For Windows
+        # On Linux/macOS, you'd use: ps_proc.nice(15)
+
+        # We don't add this to self.active_processes because it has a special shutdown lifecycle
+        return proc, proc.stdin
+
+    def shutdown_all(self):
+        with self.lock:
+            for proc in self.active_processes:
+                if proc.poll() is None: # If the process is still running
+                    try:
+                        proc.terminate() # Send SIGTERM
+                    except Exception as e:
+                        print(f"Error terminating ffmpeg process {proc.pid}: {e}")
 
 def input_capture_worker(event_queue: Queue):
     """Listens for keyboard and mouse events and puts them on the event queue."""
@@ -551,8 +695,16 @@ def video_encoding_worker_loop(task_queue, result_queue, output_path):
         proc = video_encoder.start_encode_slice(frames, timestamps, quality)
         
         if proc:
-            # This is the crucial part: the WORKER waits, not the main loop
-            return_code = proc.wait() 
+            # --- MODIFICATION: Capture and print stderr on failure ---
+            # proc.wait() returns the exit code. We also want the error output.
+            stdout_data, stderr_data = proc.communicate()
+            return_code = proc.returncode
+            if return_code != 0:
+                print(f"[{os.getpid()}] FFMPEG encoding job failed with code {return_code}.")
+                # Decode stderr from bytes to string for printing
+                error_message = stderr_data.decode('utf-8', errors='ignore')
+                if error_message:
+                    print(f"--- FFMPEG Error Output ---\n{error_message}\n---------------------------")
             print(f"[{os.getpid()}] Encoding job finished with code {return_code}.")
 
         # Signal completion back to the main loop
@@ -560,50 +712,169 @@ def video_encoding_worker_loop(task_queue, result_queue, output_path):
 
     print(f"[{os.getpid()}] Encoding worker finished.")
 
+def baseline_recorder_loop(baseline_queue: Queue, output_path: str, config: dict, shutdown_event: Event):
+    """
+    A dedicated process that consumes frames and writes them to a continuous,
+    low-quality FFMPEG process.
+    """
+    # --- THIS IS THE FIX ---
+    # The worker gets its own encoder instance, created after the process starts.
+    video_encoder = VideoEncoder(output_path)
+    # --- END FIX ---
+
+    worker_pid = os.getpid()
+    print(f"[{worker_pid}] Baseline Recorder process started.")
+    
+    ffmpeg_proc = None
+    ffmpeg_pipe = None
+
+    try:
+        while not shutdown_event.is_set():
+            try:
+                timestamp, frame = baseline_queue.get(timeout=0.5)
+
+                # On the very first frame, initialize the encoder
+                if ffmpeg_proc is None:
+                    frame_shape = frame.shape
+                    ffmpeg_proc, ffmpeg_pipe = video_encoder.start_continuous_encode(
+                        dimensions=frame_shape,
+                        fps=config['capture_fps']
+                    )
+                
+                # Write frame to the pipe
+                ffmpeg_pipe.write(frame.tobytes())
+
+            except queue.Empty:
+                # If the queue is empty, check if we should shut down
+                if shutdown_event.is_set():
+                    break
+                continue
+            except (IOError, BrokenPipeError):
+                print(f"[{worker_pid}] FFMPEG pipe broke. Exiting baseline recorder.")
+                break
+
+    finally:
+        if ffmpeg_proc and ffmpeg_pipe:
+            print(f"[{worker_pid}] Closing FFMPEG pipe and finalizing baseline video...")
+            ffmpeg_pipe.close()
+            # Log ffmpeg's output for debugging if it failed
+            stderr_output = ffmpeg_proc.stderr.read().decode(errors='ignore')
+            if ffmpeg_proc.wait() != 0:
+                print(f"[{worker_pid}] FFMPEG process exited with non-zero status.")
+                print(f"FFMPEG stderr:\n{stderr_output}")
+        print(f"[{worker_pid}] Baseline Recorder process finished.")
 # =====================================================================================
 #  NEW: DEDICATED PROCESS LOOPS
 # =====================================================================================
 
 def capture_process_loop(raw_frame_queue: Queue, config: dict, shutdown_event: Event):
     """
-    The Collector: The fastest, dumbest part of the pipeline.
-    Its only job is to grab frames and put them on a queue. It cannot be blocked.
+    The Collector & Baseline Recorder: This single process has two jobs:
+    1. Grabs frames at high frequency and puts them onto the salience queue.
+    2. Uses a non-blocking internal queue to pass frames to a dedicated writer
+       thread that handles the potentially blocking write to the FFMPEG pipe.
     """
-    print(f"[{os.getpid()}] Capture process started.")
+    pid = os.getpid()
+    print(f"[{pid}] Capture & Baseline Recorder process started.")
+
+    # --- Local State for this Process ---
+    video_encoder = VideoEncoder(config['output_path'])
     window_finder = get_window_finder()
-    
-    with mss.mss() as sct:
-        while not shutdown_event.is_set():
-            start_time = time.time()
-            
-            # Find the window to capture
-            monitor = window_finder.find_window_by_title(config['window_name'])
-            if monitor is None:
-                time.sleep(0.5)
-                continue
 
-            img = sct.grab(monitor)
-            frame_bgr = np.array(img)[:,:,:3]
-            
-            # --- FIX: Convert from BGR to RGB ---
-            # This uses numpy slicing to reverse the order of the last dimension (the color channels)
-            frame_rgb = frame_bgr[:, :, ::-1]
+    # FFMPEG process management
+    ffmpeg_proc = None
+    ffmpeg_pipe = None
+    current_dimensions = None
 
+    # --- NEW: Internal queue and thread for non-blocking writes ---
+    baseline_write_queue = queue.Queue(maxsize=config['capture_fps']) # Buffer up to 1s of frames
+    writer_thread = None
+
+    def _pipe_writer_loop(pipe, internal_queue, shutdown):
+        """This function runs in a separate thread. Its only job is to
+        pull frames from the internal queue and perform the blocking write."""
+        while not shutdown.is_set():
             try:
-                # Put the raw frame and timestamp on the queue
-                raw_frame_queue.put_nowait((start_time, frame_rgb))
-            except queue.Full:
-                # This is our safety valve. If the downstream Triage is falling behind,
-                # we drop frames here to protect the capture process.
-                print(f"[{os.getpid()}] WARNING: Raw frame queue is full. Triage is not keeping up. Dropping frame.")
+                frame = internal_queue.get(timeout=0.1)
+                # --- THIS IS THE FIX ---
+                # Ensure the frame data is in a packed, C-contiguous memory layout
+                # before writing its bytes. This removes any stride/padding.
+                contiguous_frame = np.ascontiguousarray(frame)
+                pipe.write(contiguous_frame.tobytes())
+                # --- END FIX ---
+            except queue.Empty:
+                continue
+            except (IOError, BrokenPipeError):
+                print(f"[{pid}] FFMPEG writer thread detected a broken pipe. Exiting.")
+                break
+        print(f"[{pid}] FFMPEG writer thread finished.")
 
-            # Sleep to maintain target FPS
-            elapsed = time.time() - start_time
-            sleep_time = (1.0 / config['capture_fps']) - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-                
-    print(f"[{os.getpid()}] Capture process finished.")
+    def _finalize_encoder():
+        nonlocal ffmpeg_proc, ffmpeg_pipe, current_dimensions, writer_thread
+        if writer_thread and writer_thread.is_alive():
+            writer_thread.join(timeout=1.0) # Wait for the writer to finish
+        writer_thread = None
+
+        if ffmpeg_proc and ffmpeg_pipe:
+            print(f"[{pid}] Finalizing baseline video segment...")
+            ffmpeg_pipe.close()
+            stderr = ffmpeg_proc.stderr.read().decode(errors='ignore')
+            if ffmpeg_proc.wait() != 0 and stderr:
+                print(f"[{pid}] FFMPEG stderr:\n{stderr}")
+        ffmpeg_proc, ffmpeg_pipe, current_dimensions = None, None, None
+
+    try:
+        with mss.mss() as sct:
+            while not shutdown_event.is_set():
+                start_time = time.time()
+                try:
+                    monitor = window_finder.find_window_by_title(config['window_name'])
+                    if monitor is None:
+                        if ffmpeg_proc: _finalize_encoder()
+                        time.sleep(0.5)
+                        continue
+
+                    img = sct.grab(monitor)
+                    frame_rgb = np.array(img)[:, :, :3][:, :, ::-1]
+
+                    if frame_rgb.shape != current_dimensions:
+                        print(f"[{pid}] Detected dimension change to {frame_rgb.shape}. Restarting baseline encoder.")
+                        _finalize_encoder()
+                        ffmpeg_proc, ffmpeg_pipe = video_encoder.start_continuous_encode(
+                            dimensions=frame_rgb.shape, fps=config['capture_fps']
+                        )
+                        current_dimensions = frame_rgb.shape
+                        # Start a new writer thread for the new pipe
+                        writer_thread = Thread(target=_pipe_writer_loop, args=(ffmpeg_pipe, baseline_write_queue, shutdown_event))
+                        writer_thread.start()
+
+                    # --- 1. Push frame to Salience Pipeline (NON-BLOCKING) ---
+                    try:
+                        raw_frame_queue.put_nowait((start_time, frame_rgb))
+                    except queue.Full:
+                        print(f"[{pid}] WARNING: Salience raw frame queue is full. Dropping frame for analysis.")
+
+                    # --- 2. Push frame to Baseline Writer Thread (NON-BLOCKING) ---
+                    if writer_thread:
+                        try:
+                            baseline_write_queue.put_nowait(frame_rgb)
+                        except queue.Full:
+                            # This is now safe. FFMPEG is behind, so we just drop a baseline frame.
+                            pass
+
+                except WindowNotFoundError:
+                    if ffmpeg_proc: _finalize_encoder()
+                    time.sleep(0.5)
+                    continue
+
+                elapsed = time.time() - start_time
+                sleep_time = (1.0 / config['capture_fps']) - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+    finally:
+        print(f"[{pid}] Capture process shutting down...")
+        _finalize_encoder()
+        print(f"[{pid}] Capture process finished.")
 
 def _stage_and_dispatch_chunk(frames: list, timestamps: list, salience_task_queue: Queue, shm_notification_queue: Queue):
     """
@@ -792,7 +1063,8 @@ class Orchestrator:
             # --- STEP 2: If keyframes exist, dispatch encoding jobs that need the SHM block ---
             if keyframes:
                 # Merge time intervals
-                intervals = [[event['timestamp'] - 2.0, event['timestamp'] + 2.0] for event in keyframes]
+                padding = self.config.get('keyframe_padding_seconds', 2.0) # Default to 2.0 if not set
+                intervals = [[event['timestamp'] - padding, event['timestamp'] + padding] for event in keyframes]
                 intervals.sort(key=lambda x: x[0])
                 merged_intervals = []
                 if intervals:
@@ -889,15 +1161,15 @@ class Orchestrator:
 
         if pipeline_depth > self.max_pipeline_depth:
             # We are backlogged. Increase chunk size to reduce analysis overhead per second of video.
-            if self.config['chunk_seconds'] < 15:
+            if self.config['chunk_seconds'] < 20:
                 self.config['chunk_seconds'] += 1
                 print(f"PIPELINE BACKLOG DETECTED (depth: {pipeline_depth}). Increasing chunk size to {self.config['chunk_seconds']}s.")
         elif pipeline_depth < self.min_pipeline_depth:
             # We have spare capacity. Decrease chunk size for lower latency.
-             if self.config['chunk_seconds'] > 5:
-                self.config['chunk_seconds'] -= 1
-                print(f"PIPELINE CAPACITY AVAILABLE (depth: {pipeline_depth}). Decreasing chunk size to {self.config['chunk_seconds']}s.")
-
+            #if self.config['chunk_seconds'] > 5:
+            #    self.config['chunk_seconds'] -= 1
+            #    print(f"PIPELINE CAPACITY AVAILABLE (depth: {pipeline_depth}). Decreasing chunk size to {self.config['chunk_seconds']}s.")
+            pass
     def start_workers(self):
         """Creates and starts all the decoupled processes and threads."""
         # --- Start Processes ---
@@ -983,144 +1255,6 @@ class Orchestrator:
 # =====================================================================================
 #  UNCHANGED CLASSES (VideoEncoder, AsyncPersistenceManager)
 # =====================================================================================
-
-class VideoEncoder:
-    """
-    Manages ffmpeg subprocesses for encoding video clips from raw frames.
-    """
-    def __init__(self, output_path: str):
-        self.output_path = output_path
-        os.makedirs(os.path.join(self.output_path, "videos"), exist_ok=True)
-        self.active_processes = [] # Keep track of all processes
-        self.lock = Lock() # To safely append to the list from multiple workers
-
-
-    def start_encode_slice(self, frames: np.ndarray, timestamps: np.ndarray, quality: str) -> subprocess.Popen:
-        """
-        Launches an ffmpeg process asynchronously to encode a set of frames.
-        
-        Args:
-            frames: A numpy array of shape (N, H, W, 3) with RGB frame data.
-            timestamps: A numpy array of shape (N,) with the timestamp for each frame.
-            quality: A string ('HIGH' or 'LOW') to determine encoding parameters.
-        
-        Returns:
-            A Popen object representing the running ffmpeg process.
-        """
-        if len(frames) == 0:
-            return None
-
-        # Calculate a stable framerate for the clip
-        durations = np.diff(timestamps)
-        avg_fps = 1.0 / np.mean(durations) if len(durations) > 0 else 30.0
-        
-        height, width, _ = frames[0].shape
-        output_filename = f"clip_{timestamps[0]:.2f}_{quality.lower()}.mp4"
-        output_filepath = os.path.join(self.output_path, "videos", output_filename)
-
-        # Configure ffmpeg parameters based on quality
-        if quality == 'HIGH':
-            crf = 20  # Lower CRF is higher quality
-            preset = 'fast'
-            resolution = f"{width}x{height}"
-        else: # VERY_LOW
-            crf = 35
-            preset = 'ultrafast'
-            # Downscale for low quality
-            resolution = f"{width//4}x{height//4}"
-
-        command = [
-            'ffmpeg',
-            '-y',  # Overwrite output file if it exists
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-s', f'{width}x{height}',  # Input size
-            '-pix_fmt', 'rgb24',
-            '-r', str(avg_fps), # Input framerate
-            '-i', '-',  # The input comes from stdin
-            '-c:v', 'libx264',
-            '-preset', preset,
-            '-crf', str(crf),
-            '-vf', f'scale={resolution}', # Apply scaling
-            '-pix_fmt', 'yuv420p',  # For compatibility
-            output_filepath,
-        ]
-
-        # Start the process with stdin piped
-        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        ps_proc = psutil.Process(proc.pid)
-
-        ps_proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS) # For Windows
-        # ps_p.nice(10) # For Linux (higher number is lower priority)
-
-        with self.lock:
-            self.active_processes.append(proc)
-        
-        # Write all frame data to the pipe in a separate thread to avoid blocking
-        def pipe_frames():
-            try:
-                # Convert to bytes and write
-                proc.stdin.write(frames.tobytes())
-            except (IOError, BrokenPipeError):
-                print(f"Warning: ffmpeg pipe broke for {output_filename}. The process may have terminated early.")
-            finally:
-                proc.stdin.close()
-        
-        Thread(target=pipe_frames).start()
-        
-        print(f"Started encoding {output_filename}...")
-        return proc
-
-    def start_continuous_encode(self, dimensions: tuple, fps: int, quality: str) -> (subprocess.Popen, io.BufferedWriter):
-        """
-        Launches a persistent ffmpeg process for a continuous, low-quality recording.
-        
-        Returns:
-            A tuple containing the Popen object and its stdin pipe.
-        """
-        height, width, _ = dimensions
-        output_filename = f"baseline_record_{time.time():.0f}.mp4"
-        output_filepath = os.path.join(self.output_path, "videos", output_filename)
-
-        # A very low quality but fast configuration
-        crf = 40
-        preset = 'ultrafast'
-        resolution = f"{width//4}x{height//4}"
-
-        command = [
-            'ffmpeg',
-            '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-s', f'{width}x{height}',
-            '-pix_fmt', 'rgb24',
-            '-r', str(fps), # Tell ffmpeg the rate of the incoming stream
-            '-i', '-',
-            '-an', # No audio
-            '-c:v', 'libx264',
-            '-preset', preset,
-            '-crf', str(crf),
-            '-vf', f'scale={resolution}',
-            '-pix_fmt', 'yuv420p',
-            output_filepath,
-        ]
-
-        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        ps_proc = psutil.Process(proc.pid)
-
-        ps_proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS) # For Windows
-        # ps_p.nice(10) # For Linux (higher number is lower priority)
-        
-        return proc, proc.stdin
-
-    def shutdown_all(self):
-        with self.lock:
-            for proc in self.active_processes:
-                if proc.poll() is None: # If the process is still running
-                    try:
-                        proc.terminate() # Send SIGTERM
-                    except Exception as e:
-                        print(f"Error terminating ffmpeg process {proc.pid}: {e}")
 
 class AsyncPersistenceManager:
     """
@@ -1228,7 +1362,8 @@ if __name__ == "__main__":
         "chunk_seconds": CHUNK_SECONDS,
         "capture_fps": CAPTURE_FPS,
         "triage_threshold": TRIAGE_THRESHOLD,
-        "salience_kernels": SALIENCE_KERNELS, # <-- Add this line
+        "keyframe_padding_seconds": KEYFRAME_PADDING_SECONDS, 
+        "salience_kernels": SALIENCE_KERNELS, 
         "salience_strategy": SALIENCE_STRATEGY,
         **STRATEGY_CONFIGS[SALIENCE_STRATEGY]
     }

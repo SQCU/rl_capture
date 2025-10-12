@@ -183,6 +183,10 @@ class HierarchicalSearchManager:
         if config:
             self.config.update(config)
 
+        # This will be reset for each chunk and used for deferred learning.
+        self.latents_from_search = {k.kernel_name: [] for k in self.kernels}
+        self.latent_cache = {} # Caches latents within a single chunk's search
+
         self.siglip_stream = torch.cuda.Stream()
         self.ocr_stream = torch.cuda.Stream()
         # A map to make it easy to look up
@@ -248,130 +252,124 @@ class HierarchicalSearchManager:
             results[name] = torch.stack(latents).to(self.kernels[0].device)
         return results
 
-    def _exhaustive_scan(self, frames_chunk: list, timestamps_chunk: list, start_idx: int, end_idx: int, search_log: list) -> list:
+    def _recursive_search_step(self, frames_chunk: list, timestamps_chunk: list, search_queue: deque, start_idx: int, end_idx: int, depth: int, is_hot: bool, search_log: list) -> tuple[list, int]:
         """
-        Performs a fine-grained scan, creating keyframes for every novel transition.
+        Performs a single, sparse probe of a span and queues further work based on adaptive parameters.
+        Returns a tuple of (keyframes_found_in_this_step, frames_processed_in_this_step).
         """
-        span_indices = list(range(start_idx, end_idx + 1))
-        if len(span_indices) < 2: return []
+        # --- 1. Determine search parameters based on "hotness" ---
+        if is_hot:
+            k_to_use = self.config.get("top_k", 2)
+            max_d_to_use = self.config.get("max_d", 3)
+        else: # "Cold" or "Lazy" search
+            k_to_use = self.config.get("top_k_lazy", 1)
+            max_d_to_use = self.config.get("max_d_lazy", 2)
+
+        # --- 2. Termination checks for this branch ---
+        if depth >= max_d_to_use:
+            search_log.append({'type': 'terminate_branch', 'reason': 'max_depth_reached', 'depth': depth})
+            return [], 0 # Return no keyframes, 0 frames processed
+
+        span_size = end_idx - start_idx + 1
+        branching_factor = self.config['branching_factor']
+        if span_size <= branching_factor:
+            search_log.append({'type': 'terminate_branch', 'reason': 'span_too_small', 'size': span_size})
+            return [], 0
         
-        all_latents_by_kernel = self._get_latents_for_indices(frames_chunk, span_indices)
-        keyframes_found = [] # Local list to hold results
+        # --- 3. Perform the sparse probe ---
+        sentinel_indices = np.linspace(start_idx, end_idx, branching_factor, dtype=int).tolist()
+        all_latents_by_kernel = self._get_latents_for_indices(frames_chunk, sentinel_indices)
 
-        search_log.append({'type': 'exhaustive_scan', 'span': (timestamps_chunk[start_idx], timestamps_chunk[end_idx]), 'num_frames': len(span_indices)})
-
-        for kernel in self.kernels:
-            latents_tensor = all_latents_by_kernel[kernel.kernel_name]
-            kernel.tracker.update(latents_tensor) # Update the tracker first
-
-            scores = kernel.tracker.get_novelty_scores(latents_tensor)
-            is_novel_mask = kernel.tracker.is_novel(scores)
-            
-            novel_indices = torch.where(is_novel_mask)[0]
-            cpu_scores = scores.detach().cpu().float().numpy()
-
-            for i in novel_indices:
-                # The event corresponds to the transition *ending* at this frame
-                event_index = start_idx + i.item()
-                event = kernel.create_keyframe_event(timestamps_chunk[event_index], float(cpu_scores[i]), "exhaustive_scan_spike")
-                keyframes_found.append(event) # Append to our local list
-            
-        return keyframes_found # Return the list
-
-
-    def _recursive_search_step(self, frames_chunk: list, timestamps_chunk: list, search_queue: deque, start_idx: int, end_idx: int, depth: int, search_log: list) -> list:
-        """
-        Performs a coarse-grained scan. It BOTH creates keyframes for novel coarse
-        transitions AND schedules deeper searches.
-        """
-        sentinel_indices = np.linspace(start_idx, end_idx, self.config['branching_factor'], dtype=int)
-        all_latents_by_kernel = self._get_latents_for_indices(frames_chunk, sentinel_indices.tolist())
-
-        for kernel in self.kernels:
-            kernel.tracker.update(all_latents_by_kernel[kernel.kernel_name])
+        # Add all computed latents to our cache for the final batch update
+        for kernel_name, latents_tensor in all_latents_by_kernel.items():
+            self.latents_from_search[kernel_name].append(latents_tensor)
         
-        keyframes_found = [] # Local list to hold results
-        found_hotspot = False
-        max_score_info = {'score': -1.0, 'span': None, 'reason': None}
+        frames_processed_this_step = len(sentinel_indices)
+        keyframes_found = []
+        sub_spans_to_consider = []
 
+        # --- 4. Evaluate sub-spans and prepare for ranking ---
         for i in range(len(sentinel_indices) - 1):
             sub_span_start, sub_span_end = int(sentinel_indices[i]), int(sentinel_indices[i+1])
-            
+            is_sub_span_hot = False
+            highest_score_in_sub_span = -1.0
+
             for kernel in self.kernels:
-                latents_tensor_slice = all_latents_by_kernel[kernel.kernel_name][[i, i+1]]
-                score_tensor = kernel.tracker.get_novelty_scores(latents_tensor_slice)[0]
-                is_novel_flag = kernel.tracker.is_novel(score_tensor.unsqueeze(0))[0]
+                latents_slice = all_latents_by_kernel[kernel.kernel_name][[i, i+1]]
+                scores_tensor = kernel.tracker.get_novelty_scores(latents_slice)
+                is_novel_mask = kernel.tracker.is_novel(scores_tensor)
 
-                if is_novel_flag.item():
-                    # --- FIX: A surprising coarse transition IS a keyframe ---
-                    event_index = sub_span_end
-                    event = kernel.create_keyframe_event(timestamps_chunk[event_index], score_tensor.item(), "recursive_search_spike")
+                if is_novel_mask.any().item():
+                    is_sub_span_hot = True
+                    max_score_val = scores_tensor.max().item()
+                    event_idx = sub_span_start if scores_tensor.argmax().item() == 0 else sub_span_end
+                    
+                    event = kernel.create_keyframe_event(timestamps_chunk[event_idx], max_score_val, "sparse_search_spike")
                     keyframes_found.append(event)
+                
+                highest_score_in_sub_span = max(highest_score_in_sub_span, scores_tensor.max().item())
 
-                    # Also schedule this span for a deeper look
-                    search_queue.append((sub_span_start, sub_span_end, depth + 1))
-                    search_log.append({
-                        'type': 'recursive_descent', 
-                        'span_indices': (sub_span_start, sub_span_end), 
-                        'reason': f'{kernel.kernel_name}_spike', 
-                        'score': score_tensor.item()
-                    })
-                    found_hotspot = True
-                    break # One kernel is enough to flag the span
-            
-            # --- MODIFIED: Also use .item() for the max score comparison ---
-            # Get the scalar value of the last computed score
-            current_score_value = score_tensor.item()
-            if current_score_value > max_score_info['score']:
-                max_score_info.update({
-                    'score': current_score_value, 
-                    'span': (sub_span_start, sub_span_end), 
-                    'reason': f'{kernel.kernel_name}_max_score'
-                })
+            sub_spans_to_consider.append({
+                'score': highest_score_in_sub_span,
+                'start': sub_span_start,
+                'end': sub_span_end,
+                'is_hot': is_sub_span_hot # Carry the "hot" status forward
+            })
+        
+        # --- 5. Rank and queue the next steps ---
+        sub_spans_to_consider.sort(key=lambda x: x['score'], reverse=True)
+        for i in range(min(k_to_use, len(sub_spans_to_consider))):
+            span_to_queue = sub_spans_to_consider[i]
+            search_queue.append((span_to_queue['start'], span_to_queue['end'], depth + 1, span_to_queue['is_hot']))
+            search_log.append({'type': 'queue_sub_span', 'depth': depth + 1, 'is_hot': span_to_queue['is_hot'], 'score': span_to_queue['score']})
 
-        # If no statistically significant spike was found, descend into the most different sub-span.
-        if not found_hotspot and max_score_info['span'] is not None:
-            search_queue.append((*max_score_info['span'], depth + 1))
-            search_log.append({'type': 'recursive_descent_optimistic', **max_score_info})
-        return keyframes_found # Return the list
+        return keyframes_found, frames_processed_this_step
 
     def process_chunk(self, frames_chunk: list, timestamps_chunk: list, shutdown_event: Event) -> dict:
-        self.latent_cache = {}
+        # Reset state for the new chunk
+        self.latent_cache.clear()
+        self.latents_from_search = {k.kernel_name: [] for k in self.kernels}
         if not frames_chunk: return {'keyframes': [], 'search_log': []}
 
-        # --- NEW: Perform an initial, full-chunk update for the trackers ---
-        # This is the most important fix. It "pre-warms" the model on the entire
-        # chunk's coarse representation before any scoring begins.
-        initial_sentinel_indices = np.linspace(0, len(frames_chunk) - 1, self.config['branching_factor'], dtype=int).tolist()
-        initial_latents = self._get_latents_for_indices(frames_chunk, initial_sentinel_indices)
-        for kernel in self.kernels:
-            kernel.tracker.update(initial_latents[kernel.kernel_name])
-
-        search_queue = deque([(0, len(frames_chunk) - 1, 1)])
+        # --- 1. Setup search budget and initial state ---
+        processing_budget = int(len(frames_chunk) * self.config.get("max_p", 0.33))
+        frames_processed = 0
         final_events, search_log = [], []
 
-        with tqdm(total=len(frames_chunk), desc=f"[{self.worker_id}] Search", unit="frame", position=0) as pbar:
+        # The queue tracks: (start, end, depth, is_hot). The root is always considered "hot".
+        search_queue = deque([(0, len(frames_chunk) - 1, 0, True)])
+        
+        pbar_desc = f"[{self.worker_id}] Sparse Search (Budget: {processing_budget} frames)"
+        with tqdm(total=processing_budget, desc=pbar_desc, unit="frame") as pbar:
             while search_queue:
-                if shutdown_event.is_set(): break
-                start_idx, end_idx, depth = search_queue.popleft()
+                if shutdown_event.is_set() or frames_processed >= processing_budget:
+                    if frames_processed >= processing_budget:
+                        search_log.append({'type': 'terminate_search', 'reason': 'budget_exceeded'})
+                    break
                 
-                keyframes_from_step = [] # Temp list to hold results from this step
-                
-                if (end_idx - start_idx + 1) <= self.config['min_exhaustive_size']:
-                    # Call the exhaustive scan and capture its results
-                    keyframes_from_step = self._exhaustive_scan(frames_chunk, timestamps_chunk, start_idx, end_idx, search_log)
-                    pbar.update(end_idx - start_idx + 1)
-                else:
-                    # Call the recursive scan and capture its results
-                    keyframes_from_step = self._recursive_search_step(frames_chunk, timestamps_chunk, search_queue, start_idx, end_idx, depth, search_log)
-                    pbar.update(self.config['branching_factor'])
+                start_idx, end_idx, depth, is_hot = search_queue.popleft()
 
-                # --- THE CRITICAL FIX ---
-                # Add the keyframes found in this step to the final list.
+                # --- 2. Execute one step of the recursive search ---
+                keyframes_from_step, processed_this_step = self._recursive_search_step(
+                    frames_chunk, timestamps_chunk, search_queue,
+                    start_idx, end_idx, depth, is_hot, search_log
+                )
+                
                 if keyframes_from_step:
                     final_events.extend(keyframes_from_step)
+                
+                frames_processed += processed_this_step
+                pbar.update(processed_this_step)
 
-        pbar.update(pbar.total - pbar.n)
+        # --- 3. Deferred Batch Learning: Train the model on everything we saw ---
+        search_log.append({'type': 'deferred_learning', 'total_latents': sum(len(l) for l in self.latents_from_search.values())})
+        for kernel in self.kernels:
+            kernel_name = kernel.kernel_name
+            if self.latents_from_search[kernel_name]:
+                all_latents_tensor = torch.cat(self.latents_from_search[kernel_name], dim=0)
+                # The update call now trains the PCA model AND the score statistics
+                kernel.tracker.update(all_latents_tensor)
+        
         return {'keyframes': final_events, 'search_log': search_log}
 
 
