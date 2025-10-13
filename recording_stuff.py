@@ -11,13 +11,14 @@ import time
 import uuid
 import os
 import io
+import sys
 import numpy as np
 import subprocess
 import queue 
 from multiprocessing import Process, Queue, shared_memory, Event
 from threading import Thread, Lock
 from PIL import Image
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass
 import psutil
 
@@ -63,7 +64,7 @@ STRATEGY_CONFIGS = {
         "branching_factor": 8, # Override the worker's default of 8
         "min_exhaustive_size": 8, # Override the worker's default of 16
         "max_batch_size": 8,
-        "top_k": 3,          # Explore the top 2 sub-spans in a "hot" region.
+        "top_k": 2,          # Explore the top 2 sub-spans in a "hot" region.
         "max_d": 4,          # Max recursion depth for "hot" regions.
         "top_k_lazy": 1,     # Explore only the top sub-span in a "cold" region.
         "max_d_lazy": 2,     # Give up on "cold" regions faster.
@@ -78,6 +79,52 @@ STRATEGY_CONFIGS = {
     }
 }
 }
+
+class ProgressLogger:
+    """
+    A utility to consolidate repetitive log lines into a single, updating line,
+    similar to tqdm's postfix.
+    """
+    def __init__(self):
+        self.last_message_key = None
+        self.message_counts = defaultdict(int)
+        self.last_line_len = 0
+
+    def log(self, message_key: str, message_template: str):
+        """
+        Logs a message. If the key is the same as the last one, it updates
+        the previous line. If it's different, it finalizes the old line
+        and starts a new one.
+        """
+        # If the message type has changed, finalize the previous line with a newline.
+        if message_key != self.last_message_key:
+            if self.last_message_key is not None:
+                sys.stdout.write("\n")
+            self.last_message_key = message_key
+            # Reset the counter for this new message type
+            self.message_counts[message_key] = 0
+
+        # Increment the count for the current message
+        self.message_counts[message_key] += 1
+        count = self.message_counts[message_key]
+
+        # Format the display string with the counter
+        display_string = f"{message_template} (x{count})"
+        
+        # Calculate padding to overwrite any previous, longer line
+        padding = ' ' * max(0, self.last_line_len - len(display_string))
+        
+        # Use carriage return `\r` to return to the start of the line and overwrite
+        sys.stdout.write(f"\r{display_string}{padding}")
+        sys.stdout.flush()
+        
+        self.last_line_len = len(display_string)
+
+    def finalize(self):
+        """Call at the end of the program to ensure the last log line gets a newline."""
+        if self.last_message_key is not None:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
 def video_encoding_worker_loop(task_queue, result_queue, output_path):
     # This worker gets its own encoder instance
@@ -363,6 +410,9 @@ class Orchestrator:
         self.shm_notification_queue = Queue() 
         self.encoding_task_queue = Queue()
         self.encoding_results_queue = Queue()
+
+        # --- ADD THIS LINE ---
+        self.progress_queue = Queue()
         
         # --- MODIFIED: This dictionary will now hold active SHM handles ---
         self.active_shm_blocks = {} # {shm_name: shm_instance}
@@ -378,6 +428,7 @@ class Orchestrator:
         
         self.processes = []
         self.threads = []
+        self.logger = ProgressLogger()
 
     def start(self):
         """Starts all worker processes and the main orchestration loop."""
@@ -395,6 +446,8 @@ class Orchestrator:
                 self.process_salience_results_queue()
                 # 3. Check for completed video encodes
                 self.process_encoding_results_queue()
+                # 3.1. homebrew pbar i guess
+                self.process_progress_queue()
                 # 4. NEW: Audit active SHM blocks for timeouts
                 self.audit_shm_blocks()
                 # 5. NEW: Adjust pipeline parameters based on load
@@ -503,6 +556,34 @@ class Orchestrator:
             # For now, just confirming it's done is enough.
             print(f"Orchestrator: Confirmed completion of encode job.")
 
+    def process_progress_queue(self):
+        """
+        Processes heartbeat messages from Salience workers. A heartbeat
+        indicates that a chunk is still being actively processed, so we
+        reset its timeout clock to prevent it from being prematurely cleaned up.
+        """
+        while not self.progress_queue.empty():
+            try:
+                msg = self.progress_queue.get_nowait()
+                shm_name = msg.get('shm_name')
+
+                if shm_name:
+                    with self.shm_lock:
+                        if shm_name in self.active_shm_blocks:
+                            # We received a sign of life! Reset the timeout timer.
+                            self.active_shm_blocks[shm_name]['timestamp'] = time.time()
+                            
+                            # Optional: Log the heartbeat for debugging
+                            # The key is the shm_name itself
+                            key = f"heartbeat_{shm_name}"
+                            # The template is the string without the counter
+                            template = f"Orchestrator: Received heartbeat for {shm_name}. Resetting timeout."
+                            self.logger.log(key, template)
+            except queue.Empty:
+                break
+            except Exception as e:
+                print(f"Orchestrator: Error processing progress queue: {e}")
+
     def claim_new_shm_blocks(self):
         """Claims new SHM blocks announced by the Dispatcher."""
         while not self.shm_notification_queue.empty():
@@ -538,7 +619,9 @@ class Orchestrator:
                 meta = self.active_shm_blocks.pop(name)
                 meta['shm'].close()
                 meta['shm'].unlink()
-                print(f"Orchestrator: Cleaned up SHM block {name}.")
+                key = f"cleanup_{name}"
+                template = f"Orchestrator: Cleaned up SHM block {name}."
+                self.logger.log(key, template)
 
     def adapt_pipeline(self):
         """Dynamically adjusts capture parameters based on processing load."""
@@ -570,7 +653,9 @@ class Orchestrator:
         for i in range(self.num_salience_workers):
             # --- MODIFIED: The arguments are now simpler and more generic ---
             p = Process(target=sal_wo.analysis_worker_loop, 
-                        args=(self.salience_task_queue, self.salience_results_queue, self.config, self.config['output_path'], self.shutdown_event), 
+                        args=(self.salience_task_queue, self.salience_results_queue, 
+                        self.config, self.config['output_path'], self.shutdown_event,
+                        self.progress_queue), 
                         name=f"Salience-{i}", daemon=True)
             self.processes.append(p)
         for i in range(self.num_encoding_workers):
@@ -637,6 +722,7 @@ class Orchestrator:
             all_names = list(self.active_shm_blocks.keys())
         for name in all_names:
             self.cleanup_shm_block(name)
+        self.logger.finalize()
         print("-> Shutdown complete.")
 
 # =====================================================================================

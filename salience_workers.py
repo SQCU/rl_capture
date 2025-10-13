@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import os
 import time  # --- NEW ---
 from tqdm import tqdm # --- NEW ---
-from multiprocessing import shared_memory, Event
+from multiprocessing import shared_memory, Event, Queue
 from transformers import AutoModel, AutoProcessor, AutoModelForCausalLM, AutoImageProcessor
 from PIL import Image
 from collections import deque
@@ -209,274 +209,217 @@ class OCRLatentKernel(SalienceKernel):
         return latent_vectors
 
 # =====================================================================================
-#  NEW ARCHITECTURE: The Search Manager (The "Brain")
+#  NEWER ARCHITECTURE: DECOUPLED FRAME PARSING 'KERNELS'
 # =====================================================================================
 
-class HierarchicalSearchManager:
-    """
-    Manages the recursive search process, polls kernels for novelty,
-    and logs the entire search timeline. It is model-agnostic.
-    """
+import heapq
+
+class EventContext:
+    def __init__(self):
+        self.priority_events = []
+        # --- NEW: Add a counter for tie-breaking ---
+        self.counter = 0
+    def publish(self, z_score: float, event: dict):
+        # --- MODIFIED: Push a 3-element tuple ---
+        # The tuple is now (-z_score, count, event).
+        # If z-scores are equal, Python will compare the counts, which are always unique.
+        # The dictionaries will never be compared.
+        heapq.heappush(self.priority_events, (-z_score, self.counter, event))
+        self.counter += 1
+    def get_new_events_for_agent(self, agent_last_seen_count: int) -> list[dict]:
+        """Returns new events since the agent last checked."""
+        # We now return the third element (index 2) of the stored tuple
+        return [item[2] for item in self.priority_events[agent_last_seen_count:]]
+
+class SearchAgent:
+    """An agent that launches GPU work WITHOUT BLOCKING."""
+    def __init__(self, kernel, agent_config, frame_accessor, timestamps, event_context, stream):
+        self.kernel = kernel
+        self.config = agent_config
+        self.frame_accessor = frame_accessor
+        self.timestamps = np.array(timestamps)
+        self.event_context = event_context
+        self.stream = stream
+        self.work_queue = deque([(0, len(frame_accessor) - 1, 0, True)])
+        self.computed_latents_for_update = []
+        self.pending_results = deque()
+        self.last_seen_event_count = 0
+        self.cross_pollination_window = self.config.get("cross_pollination_window_seconds", 1.0)
+        # --- NEW: Give each agent its own budget and counter ---
+        self.search_log = [] # Give each agent a log
+        self.budget = int(len(frame_accessor) * self.config.get("max_p", 0.33))
+        self.frames_processed = 0
+
+    def has_work(self) -> bool:
+        return bool(self.work_queue) or bool(self.pending_results)
+    
+    def _poll_event_context(self):
+        new_events = self.event_context.get_new_events_for_agent(self.last_seen_event_count)
+        self.last_seen_event_count = len(self.event_context.priority_events)
+        if not new_events: return
+        for event in new_events:
+            if event['source_kernel'] != self.kernel.kernel_name:
+                start_time = event['timestamp'] - self.cross_pollination_window
+                end_time = event['timestamp'] + self.cross_pollination_window
+                start_idx = np.searchsorted(self.timestamps, start_time, side='left')
+                end_idx = np.searchsorted(self.timestamps, end_time, side='right')
+                start_idx, end_idx = max(0, start_idx), min(len(self.timestamps) - 1, end_idx)
+                if start_idx < end_idx: self.work_queue.appendleft((start_idx, end_idx, 0, True))
+    
+    def launch_work(self):
+        if self.frames_processed >= self.budget:
+            # Budget exhausted, clear the remaining work queue to stop the search.
+            self.work_queue.clear()
+            return False 
+        if len(self.pending_results) >= 4: return False
+        #max 4 in-flight operations
+        self._poll_event_context()
+        if not self.work_queue: return False
+        
+        start_idx, end_idx, depth, is_hot = self.work_queue.popleft()
+        branching_factor = self.config['branching_factor']
+        if is_hot:
+            k_to_use, max_d_to_use = self.config.get("top_k", 2), self.config.get("max_d", 3)
+        else:
+            k_to_use, max_d_to_use = self.config.get("top_k_lazy", 1), self.config.get("max_d_lazy", 2)
+        
+        if depth >= max_d_to_use: 
+            self.search_log.append({'type': 'terminate_branch', 'reason': 'max_depth/size', 'depth': depth})
+            return False
+        
+        sentinel_indices = np.linspace(start_idx, end_idx, branching_factor, dtype=int).tolist()
+        # --- NEW: Increment the counter ---
+        self.frames_processed += len(sentinel_indices)
+
+        with torch.cuda.stream(self.stream):
+            images = self.frame_accessor.get_batch(sentinel_indices)
+            latents = self.kernel.get_latents_for_images(images)
+            latents_cpu = latents.to('cpu', non_blocking=True)
+        
+        self.pending_results.append({
+            'sentinel_indices': sentinel_indices, 'latents': latents_cpu,
+            'start_idx': start_idx, 'end_idx': end_idx, 'depth': depth,
+            'is_hot': is_hot, 'k_to_use': k_to_use
+        })
+        return True
+    
+    def poll_results(self):
+        if not self.pending_results or not self.stream.query():
+            return False # --- FIX: Signal that no results were processed ---
+        
+        result = self.pending_results.popleft()
+        latents_cpu = result['latents']
+        latents_gpu = latents_cpu.to(self.kernel.device)
+        scores = self.kernel.tracker.get_novelty_scores(latents_gpu)
+        is_novel_mask, z_scores = self.kernel.tracker.is_novel(scores)
+        
+        self.computed_latents_for_update.append(latents_gpu)
+        
+        sub_spans = []
+        for i in range(len(result['sentinel_indices']) - 1):
+            sub_span_start = int(result['sentinel_indices'][i])
+            sub_span_end = int(result['sentinel_indices'][i+1])
+            is_novel = is_novel_mask[i].item() or is_novel_mask[i+1].item()
+            max_z = max(z_scores[i].item(), z_scores[i+1].item())
+            sub_spans.append({'start': sub_span_start, 'end': sub_span_end, 'is_hot': is_novel, 'z_score': max_z})
+            
+            if is_novel:
+                event_idx_in_batch = i if z_scores[i] > z_scores[i+1] else i + 1
+                event = {
+                    "source_kernel": self.kernel.kernel_name,
+                    "timestamp": self.timestamps[result['sentinel_indices'][event_idx_in_batch]],
+                    "score": scores[event_idx_in_batch].item(),
+                    "z_score": z_scores[event_idx_in_batch].item(),
+                }
+                self.event_context.publish(z_scores[event_idx_in_batch].item(), event)
+        
+        sub_spans.sort(key=lambda x: x['z_score'], reverse=True)
+        k = result['k_to_use'] if any(s['is_hot'] for s in sub_spans) else self.config.get("top_k_lazy", 1)
+        for i in range(min(k, len(sub_spans))):
+            span = sub_spans[i]
+            self.work_queue.append((span['start'], span['end'], result['depth'] + 1, span['is_hot']))
+            self.search_log.append({'type': 'queue_span', 'depth': result['depth'] + 1, 'z_score': span['z_score']})
+        return True # --- FIX: Signal that a result was processed ---
+class HierarchicalSearchCoordinator:
     def __init__(self, kernels: list[SalienceKernel], config: dict):
         self.kernels = kernels
         self.config = config
-        self.worker_id = f"SearchManager_{os.getpid()}"
-        self.latent_cache = {}
-
-        # --- NEW: Restore the robust default configuration pattern ---
-        # 1. Start with a baseline of hard-coded, sensible defaults.
-        self.config = self._get_default_search_config()
-        # 2. Merge the externally provided config on top of the defaults.
-        if config:
-            self.config.update(config)
-
-        # This will be reset for each chunk and used for deferred learning.
-        self.latents_from_search = {k.kernel_name: [] for k in self.kernels}
-        self.latent_cache = {} # Caches latents within a single chunk's search
-
-        self.siglip_stream = torch.cuda.Stream()
-        self.ocr_stream = torch.cuda.Stream()
-        # A map to make it easy to look up
-        self.kernel_streams = {"SIGLIP": self.siglip_stream, "OCR": self.ocr_stream}
-
-    def _get_default_search_config(self) -> dict:
-        """
-        Provides a centralized, fallback configuration for the search process.
-        """
-       #print(f"[{self.worker_id}] Loading default search configuration.")
-        return {
-            "branching_factor": 8,       # How many sentinel frames to check per chunk
-            "min_exhaustive_size": 16,   # Chunks smaller than this are always processed fully
-            "max_batch_size": 16,        # A safe default for most modern GPUs
-        }
-
-    @torch.no_grad()
-    def _get_latents_for_indices(self, frame_accessor: LazyFrameAccessor, indices: list[int]) -> dict[str, torch.Tensor]:
-        # This method needs a significant rewrite to handle per-kernel batching.
-
-        # 1. Figure out what needs computing for each kernel
-        work_items_by_kernel = {k.kernel_name: [] for k in self.kernels}
-        for i in indices:
-            for k in self.kernels:
-                if (k.kernel_name, i) not in self.latent_cache:
-                    work_items_by_kernel[k.kernel_name].append(i)
-
-        # 2. Process each kernel's work items with its own batch size
-        for kernel in self.kernels:
-            kernel_name = kernel.kernel_name
-            stream = self.kernel_streams.get(kernel_name) # Get the specific stream
-            indices_to_compute = list(dict.fromkeys(work_items_by_kernel[kernel_name]))
-            if not indices_to_compute:
-                continue
-
-            # --- THE CRITICAL CHANGE ---
-            # Get the batch size specific to this kernel, with a fallback to a global default.
-            kernel_conf = self.config.get("kernel_configs", {}).get(kernel.kernel_name.lower(), {})
-            batch_size = kernel_conf.get('max_batch_size', 1) # Default to 1 for safety
-            #print(f"[{self.worker_id}] Processing for {kernel_name} with batch size {batch_size}")
-
-            for i in range(0, len(indices_to_compute), batch_size):
-                # Tell PyTorch to run this block of work on the kernel's dedicated stream
-                with torch.cuda.stream(stream):
-                    batch_indices = indices_to_compute[i : i + batch_size]
-                    images_to_process = frame_accessor.get_batch(batch_indices)
-                    
-                    latents_batch = kernel.get_latents_for_images(images_to_process)
-                    for idx, latent in zip(batch_indices, latents_batch):
-                        # The cache put happens within the stream context
-                        self.latent_cache[(kernel_name, idx)] = latent.to('cpu', non_blocking=True)
-
-        # After launching all work, you need to synchronize
-        torch.cuda.synchronize() # Wait for all streams to finish before assembling results
-
-        # 3. Assemble results (this part remains the same)
-        results = {k.kernel_name: [] for k in self.kernels}
-        for i in indices:
-            for k in self.kernels:
-                results[k.kernel_name].append(self.latent_cache[(k.kernel_name, i)])
-        
-        for name, latents in results.items():
-            results[name] = torch.stack(latents).to(self.kernels[0].device)
-        return results
-
-    def _recursive_search_step(self, frames_chunk: list, timestamps_chunk: list, search_queue: deque, start_idx: int, end_idx: int, depth: int, is_hot: bool, search_log: list) -> tuple[list, int]:
-        """
-        Performs a single, sparse probe of a span and queues further work based on adaptive parameters.
-        Returns a tuple of (keyframes_found_in_this_step, frames_processed_in_this_step).
-        """
-        # --- 1. Determine search parameters based on "hotness" (This part is fine) ---
-        if is_hot:
-            k_to_use = self.config.get("top_k", 2)
-            max_d_to_use = self.config.get("max_d", 3)
-        else: # "Cold" or "Lazy" search
-            k_to_use = self.config.get("top_k_lazy", 1)
-            max_d_to_use = self.config.get("max_d_lazy", 2)
-
-        # --- 2. Termination checks for this branch (This part is fine) ---
-        if depth >= max_d_to_use:
-            search_log.append({'type': 'terminate_branch', 'reason': 'max_depth_reached', 'depth': depth})
-            return [], 0
-
-        span_size = end_idx - start_idx + 1
-        branching_factor = self.config['branching_factor']
-        if span_size <= branching_factor:
-            search_log.append({'type': 'terminate_branch', 'reason': 'span_too_small', 'size': span_size})
-            return [], 0
-        
-        # --- 3. Perform the sparse probe ---
-        sentinel_indices = np.linspace(start_idx, end_idx, branching_factor, dtype=int).tolist()
-        all_latents_by_kernel = self._get_latents_for_indices(frames_chunk, sentinel_indices)
-
-        # Add all computed latents to our cache for the final batch update
-        for kernel_name, latents_tensor in all_latents_by_kernel.items():
-            self.latents_from_search[kernel_name].append(latents_tensor)
-        
-        frames_processed_this_step = len(sentinel_indices)
-        keyframes_found = []
-        sub_spans_to_consider = []
-
-        # --- 4. Evaluate sub-spans and prepare for ranking ---
-        for i in range(len(sentinel_indices) - 1):
-            sub_span_start, sub_span_end = int(sentinel_indices[i]), int(sentinel_indices[i+1])
-            is_sub_span_hot = False
-            highest_score_in_sub_span = -1.0
-
-            for kernel in self.kernels:
-                latents_slice = all_latents_by_kernel[kernel.kernel_name][[i, i+1]]
-                scores_tensor = kernel.tracker.get_novelty_scores(latents_slice)
-                is_novel_mask, z_scores_tensor = kernel.tracker.is_novel(scores_tensor)
-
-                if is_novel_mask.any().item():
-                    is_sub_span_hot = True
-                    max_score_val = scores_tensor.max().item()
-                    event_idx = sub_span_start if scores_tensor.argmax().item() == 0 else sub_span_end
-                    # --- ADD: Extract the corresponding Z-score ---
-                    z_score_val = z_scores_tensor[event_idx_in_batch].item()
-                    event = kernel.create_keyframe_event(timestamps_chunk[event_idx],
-                        max_score_val,
-                        "sparse_search_spike", 
-                        z_score=z_score_val)
-                    keyframes_found.append(event)
-                
-                highest_score_in_sub_span = max(highest_score_in_sub_span, scores_tensor.max().item())
-
-            sub_spans_to_consider.append({
-                'score': highest_score_in_sub_span,
-                'start': sub_span_start,
-                'end': sub_span_end,
-                'is_hot': is_sub_span_hot # Carry the "hot" status forward
-                
-            })
-        
-            sub_spans_to_consider.sort(key=lambda x: x['score'], reverse=True)
-        
-        any_hot_spans_found = any(s['is_hot'] for s in sub_spans_to_consider)
-        
-        if any_hot_spans_found:
-            # --- Standard Path: At least one sub-span is interesting ---
-            # Explore the top `k_to_use` spans.
-            for i in range(min(k_to_use, len(sub_spans_to_consider))):
-                span_to_queue = sub_spans_to_consider[i]
-                search_queue.append((span_to_queue['start'], span_to_queue['end'], depth + 1, span_to_queue['is_hot']))
-                search_log.append({'type': 'queue_sub_span', 'depth': depth + 1, 'is_hot': span_to_queue['is_hot'], 'score': span_to_queue['score']})
-        else:
-            # --- "Pity Probe" Path: Nothing was hot, so we perform a LAZY search ---
-            # We use the _lazy parameters to ensure we gather some data without committing to a deep search.
-            lazy_k = self.config.get("top_k_lazy", 1)
-            lazy_max_d = self.config.get("max_d_lazy", 1)
-            
-            # We check the depth against the lazy depth limit.
-            if depth < lazy_max_d:
-                for i in range(min(lazy_k, len(sub_spans_to_consider))):
-                    span_to_queue = sub_spans_to_consider[i]
-                    # We queue the highest-scoring cold span and explicitly mark its children as `is_hot=False`.
-                    search_queue.append((span_to_queue['start'], span_to_queue['end'], depth + 1, False))
-                    search_log.append({'type': 'queue_lazy_probe', 'depth': depth + 1, 'score': span_to_queue['score']})
-
-        return keyframes_found, frames_processed_this_step
-
-    def process_chunk(self, frames_chunk: list, timestamps_chunk: list, shutdown_event: Event) -> dict:
-        # Reset state for the new chunk
-        self.latent_cache.clear()
-        self.latents_from_search = {k.kernel_name: [] for k in self.kernels}
-        if len(frames_chunk) == 0: return {'keyframes': [], 'search_log': []}
-
-        # --- 1. Setup search budget and initial state ---
-        processing_budget = int(len(frames_chunk) * self.config.get("max_p", 0.33))
-        frames_processed = 0
-        final_events, search_log = [], []
-
-        # The queue tracks: (start, end, depth, is_hot). The root is always considered "hot".
-        search_queue = deque([(0, len(frames_chunk) - 1, 0, True)])
-        
-        pbar_desc = f"[{self.worker_id}] Sparse Search (Budget: {processing_budget} frames)"
-        with tqdm(total=processing_budget, desc=pbar_desc, unit="frame") as pbar:
-            while search_queue:
-                if shutdown_event.is_set() or frames_processed >= processing_budget:
-                    if frames_processed >= processing_budget:
-                        search_log.append({'type': 'terminate_search', 'reason': 'budget_exceeded'})
-                    break
-                
-                start_idx, end_idx, depth, is_hot = search_queue.popleft()
-
-                # --- 2. Execute one step of the recursive search ---
-                keyframes_from_step, processed_this_step = self._recursive_search_step(
-                    frames_chunk, timestamps_chunk, search_queue,
-                    start_idx, end_idx, depth, is_hot, search_log
-                )
-                
-                if keyframes_from_step:
-                    final_events.extend(keyframes_from_step)
-                
-                frames_processed += processed_this_step
-                pbar.update(processed_this_step)
-
-        # --- 3. Deferred Batch Learning: Train the model on everything we saw ---
-        search_log.append({'type': 'deferred_learning', 'total_latents': sum(len(l) for l in self.latents_from_search.values())})
-        for kernel in self.kernels:
-            kernel_name = kernel.kernel_name
-            if self.latents_from_search[kernel_name]:
-                all_latents_tensor = torch.cat(self.latents_from_search[kernel_name], dim=0)
-                # The update call now trains the PCA model AND the score statistics
-                kernel.tracker.update(all_latents_tensor)
-        
-        return {'keyframes': final_events, 'search_log': search_log}
-
-
-# =====================================================================================
-#  NEW: The Kernel Factory (Registry)
-# =====================================================================================
-
-
-# This dictionary maps the string names used in the config to the actual kernel classes.
-# This is the single point of truth for what kernels are available.
-
-KERNEL_REGISTRY = {
-    "siglip": SigLIPKernel,
-    "ocr": OCRLatentKernel,
-}
-
-
-# =====================================================================================
-#  The Main Worker Loop (Now much simpler)
-# =====================================================================================
-
-def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown_event):
-    worker_pid = os.getpid()
-   #print(f"[{worker_pid}] Analysis worker started.")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config['device']=device
-
-    # --- Instantiate all enabled kernels based on config ---
-    kernels_to_load = config.get("salience_kernels", ["siglip"])
-    kernels = []
-   #print(f"[{worker_pid}] Loading kernels: {kernels_to_load}")
-    if "siglip" in kernels_to_load:
-        kernels.append(SigLIPKernel(config))
-    if "ocr" in kernels_to_load:
-        kernels.append(OCRLatentKernel(config))
+        self.streams = {k.kernel_name: torch.cuda.Stream() for k in kernels}
     
-    search_manager = HierarchicalSearchManager(kernels, config)
+    def process_chunk(self, frame_accessor: LazyFrameAccessor, timestamps_chunk: list, shutdown_event: Event, progress_queue: Queue) -> dict:
+        event_context = EventContext()
+        agents = []
+        for kernel in self.kernels:
+            agent_config = self.config.copy()
+            kernel_specific_config = self.config.get("kernel_configs", {}).get(kernel.kernel_name.lower(), {})
+            agent_config.update(kernel_specific_config)
+            agents.append(SearchAgent(
+                kernel=kernel, agent_config=agent_config, frame_accessor=frame_accessor,
+                timestamps=timestamps_chunk, event_context=event_context, stream=self.streams[kernel.kernel_name]
+            ))
+        iteration_count, concurrent_launches = 0, 0
+        shm_name = frame_accessor.shm.name
+
+        # --- CORRECTED COORDINATOR LOOP ---
+        while any(agent.has_work() for agent in agents):
+            if shutdown_event.is_set(): break
+            
+            work_done_this_loop, launches_this_loop = False, 0
+            for agent in agents:
+                if agent.launch_work():
+                    work_done_this_loop, launches_this_loop = True, launches_this_loop + 1
+                if agent.poll_results():
+                    work_done_this_loop = True
+                    progress_queue.put({'shm_name': shm_name})
+            
+            if launches_this_loop > 1: concurrent_launches += 1
+            if not work_done_this_loop: time.sleep(0.001)
+
+            iteration_count += 1
+
+        # flex concurrent launches
+        print(f"Chunk stats: {iteration_count} iterations, "
+          f"{concurrent_launches} had concurrent launches "
+          f"({100*concurrent_launches/iteration_count:.1f}% parallelism)")
+        
+        for agent in agents: agent.stream.synchronize()
+        
+        for agent in agents:
+            if agent.computed_latents_for_update:
+                all_latents = torch.cat(agent.computed_latents_for_update, dim=0)
+                agent.kernel.tracker.update(all_latents)
+        
+        final_keyframes = []
+        # --- MODIFIED: Unpack the 3-element tuple blocking heapq deadlocks ---
+        for z_score, count, event in event_context.priority_events:
+            source_kernel = next(k for k in self.kernels if k.kernel_name == event["source_kernel"])
+            if event["z_score"] > self.config['novelty_z_score_threshold']:
+                 final_keyframes.append(
+                    source_kernel.create_keyframe_event(
+                        timestamp=event["timestamp"], score=event["score"],
+                        reason="cooperative_search_spike", z_score=event["z_score"]
+                    )
+                )
+        final_search_log = {}
+        for agent in agents:
+            final_search_log[agent.kernel.kernel_name] = agent.search_log
+
+        return {'keyframes': final_keyframes, 'search_log': final_search_log}
+
+# =====================================================================================
+#  KERNEL REGISTRY
+# =====================================================================================
+KERNEL_REGISTRY = {"siglip": SigLIPKernel, "ocr": OCRLatentKernel}
+
+# =====================================================================================
+#  MAIN WORKER LOOP
+# =====================================================================================
+def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown_event, progress_queue):
+    worker_pid = os.getpid()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config['device'] = device
+    kernels = [KERNEL_REGISTRY[name](config) for name in config.get("salience_kernels", ["siglip"])]
+    search_coordinator = HierarchicalSearchCoordinator(kernels, config)
     preprocessor = lambda frame: _downscale_image(Image.fromarray(frame))
 
     while True:
@@ -485,33 +428,21 @@ def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown
             task = task_queue.get(timeout=0.1)
             if task is None: break
 
-            #shm = shared_memory.SharedMemory(name=task['shm_name'])
-            #buffer = np.ndarray(task['shape'], dtype=task['dtype'], buffer=shm.buf)
-            # doubled copy buffers? for no reason?
-            #frames_as_images = [Image.fromarray(frame) for frame in buffer]
-            #downscaled_images = [_downscale_image(img) for img in frames_as_images]
-
-            # --- LAZY INITIALIZATION ---
-            # Instantiate the accessor, injecting our defined preprocessor.
-            frame_accessor = LazyFrameAccessor(shm_name=task['shm_name'],
-                shape=task['shape'],
-                dtype=task['dtype'],
-                preprocess_fn=preprocessor)
-            
-            # The search manager now operates on the accessor, triggering
-            # lazy preprocessing for only the frames it needs.
-            result_data = search_manager.process_chunk(frame_accessor, task['timestamps'], shutdown_event)
-            
+            frame_accessor = LazyFrameAccessor(
+                shm_name=task['shm_name'], shape=task['shape'],
+                dtype=task['dtype'], preprocess_fn=preprocessor
+            )
+            # --- Pass progress_queue to the coordinator ---
+            result_data = search_coordinator.process_chunk(frame_accessor, task['timestamps'], shutdown_event, progress_queue)
             return_message = {
                 "shm_name": task['shm_name'], "shape": task['shape'],
                 "dtype": task['dtype'], "timestamps": task['timestamps'],
-                "source": "HierarchicalSearchManager", "data": result_data
+                "source": "HierarchicalSearchCoordinator", "data": result_data
             }
-            print(f"repr:{repr(result_data)}")
+            #way too big to print lol
+            #print(f"repr:{repr(result_data)}")
             return_queue.put(return_message)
-            #shm.close()
             frame_accessor.close()
-
         except queue.Empty:
             continue
         except Exception as e:
@@ -519,18 +450,9 @@ def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown
             import traceback; traceback.print_exc()
             if 'task' in locals() and task:
                 failure_message = {
-                    "shm_name": task['shm_name'],
-                    "shape": task.get('shape'), # Include what we can
-                    "dtype": task.get('dtype'),
-                    "timestamps": task.get('timestamps'),
-                    "source": "HierarchicalSearchManager",
-                    "data": {"error": str(e)} # Signal that this was a failure
+                    "shm_name": task['shm_name'], "shape": task.get('shape'),
+                    "dtype": task.get('dtype'), "timestamps": task.get('timestamps'),
+                    "source": "HierarchicalSearchCoordinator", "data": {"error": str(e)}
                 }
                 return_queue.put(failure_message)
-                
-                # Ensure we don't hold a dangling reference to the failed SHM
-                if 'shm' in locals() and shm:
-                    shm.close()
-            
-   #print(f"[{worker_pid}] Analysis worker finished.")
-
+                if 'shm' in locals() and shm: shm.close()

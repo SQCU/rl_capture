@@ -239,28 +239,28 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
         return torch.sqrt(sq_mahalanobis)
 
     def is_novel(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # --- MODIFIED: This method now returns a tuple (mask, z_scores) ---
-    
-    self.novelty_score_stats.update(scores.detach()[~torch.isnan(scores)])
-    mean, std_dev = self.novelty_score_stats.mean, self.novelty_score_stats.std_dev
-    
-    if std_dev == 0:
-        # If there's no variance, nothing is novel and Z-scores are all zero.
-        zeros = torch.zeros_like(scores, dtype=torch.bool)
-        return zeros, zeros.float()
+        # --- MODIFIED: This method now returns a tuple (mask, z_scores) ---
+        
+        self.novelty_score_stats.update(scores.detach()[~torch.isnan(scores)])
+        mean, std_dev = self.novelty_score_stats.mean, self.novelty_score_stats.std_dev
+        
+        if std_dev == 0:
+            # If there's no variance, nothing is novel and Z-scores are all zero.
+            zeros = torch.zeros_like(scores, dtype=torch.bool)
+            return zeros, zeros.float()
 
-    # --- EXPLICIT Z-SCORE CALCULATION ---
-    # Calculate the threshold for the boolean mask
-    threshold = mean + (std_dev * self.config['novelty_z_score_threshold'])
-    is_novel_mask = scores > threshold
+        # --- EXPLICIT Z-SCORE CALCULATION ---
+        # Calculate the threshold for the boolean mask
+        threshold = mean + (std_dev * self.config['novelty_z_score_threshold'])
+        is_novel_mask = scores > threshold
 
-    # Calculate the Z-score for every item in the batch for logging
-    # Use a small epsilon to prevent division by zero, although the guard above should handle it.
-    z_scores = (scores - mean) / (std_dev + 1e-8)
-    
-    # ... (the conditional logging block can remain for debugging if you wish) ...
+        # Calculate the Z-score for every item in the batch for logging
+        # Use a small epsilon to prevent division by zero, although the guard above should handle it.
+        z_scores = (scores - mean) / (std_dev + 1e-8)
+        
+        # ... (the conditional logging block can remain for debugging if you wish) ...
 
-    return is_novel_mask, z_scores
+        return is_novel_mask, z_scores
 
 # --- NEW: A factory dictionary to map config strings to classes ---
 TRACKER_STRATEGIES = {
