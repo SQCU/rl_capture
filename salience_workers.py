@@ -433,7 +433,7 @@ def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown
         except queue.Empty:
             continue
         except Exception as e:
-           #print(f"[{worker_pid}] CRITICAL ERROR in worker loop: {e}")
+            print(f"[{worker_pid}] CRITICAL ERROR in worker loop: {e}")
             import traceback; traceback.print_exc()
             if 'task' in locals() and task:
                 failure_message = {
