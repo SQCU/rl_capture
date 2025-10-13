@@ -12,9 +12,54 @@ from PIL import Image
 from collections import deque
 import queue # --- NEW ---
 import gc
+from typing import Callable
 
 # --- NEW: Import our new tracker classes ---
 from salience_trackers import NaiveZScoreTracker, PCAMahanalobisTracker, TRACKER_STRATEGIES
+
+class LazyFrameAccessor:
+    """
+        Wraps the SHM buffer and preprocesses frames only when accessed.
+        Args:
+            shm_name (str): The name of the shared memory block.
+            shape (tuple): The shape of the numpy array in SHM.
+            dtype (np.dtype): The data type of the numpy array.
+            preprocess_fn (Callable): A function that takes a raw numpy frame 
+                                      and returns a processed PIL Image.
+    """
+    def __init__(self, shm_name: str, shape: tuple, preprocess_fn: Callable[[np.ndarray], Image.Image], dtype: np.dtype):
+        self.shm = shared_memory.SharedMemory(name=shm_name)
+        self.buffer = np.ndarray(shape, dtype=dtype, buffer=self.shm.buf)
+        self.preprocess_fn = preprocess_fn
+        # Cache preprocessed images to avoid redundant work within a single chunk
+        self.cache = {}
+        self.num_frames = shape[0]
+
+    # --- NEW METHOD ---
+    def __len__(self) -> int:
+        """Returns the total number of frames in the buffer."""
+        return self.num_frames
+
+    def __getitem__(self, index: int) -> Image.Image:
+        """Retrieves and preprocesses a single frame, using a cache."""
+        if index in self.cache:
+            return self.cache[index]
+        
+        # Get the raw frame from the shared buffer
+        raw_frame = self.buffer[index]
+        
+        # Preprocess on-demand using the provided function
+        processed_frame = self.preprocess_fn(raw_frame)
+        
+        # Cache the result for future access
+        self.cache[index] = processed_frame
+        return processed_frame
+
+    def get_batch(self, indices: list[int]) -> list[Image.Image]:
+        return [self[i] for i in indices]
+
+    def close(self):
+        self.shm.close()
 
 def _downscale_image(img: Image.Image, target_pixel_area: int = 512*512) -> Image.Image:
     """
@@ -56,11 +101,13 @@ class SalienceKernel:
         """Performs inference on a batch of images and returns latents."""
         raise NotImplementedError
 
-    def create_keyframe_event(self, timestamp: float, score: float, reason: str) -> dict:
+    def create_keyframe_event(self, timestamp: float, score: float, reason: str, z_score: float) -> dict:
         """Creates a kernel-specific keyframe event dictionary."""
         return {
             "type": f"{self.kernel_name}_KEYFRAME",
-            "timestamp": timestamp, "value": score, "reason": reason
+            "timestamp": timestamp, "value": score,
+            "z_score": z_score,    # This is the new, crucial metadata
+            "reason": reason
         }
 
 class SigLIPKernel(SalienceKernel):
@@ -204,7 +251,7 @@ class HierarchicalSearchManager:
         }
 
     @torch.no_grad()
-    def _get_latents_for_indices(self, frames_chunk: list, indices: list[int]) -> dict[str, torch.Tensor]:
+    def _get_latents_for_indices(self, frame_accessor: LazyFrameAccessor, indices: list[int]) -> dict[str, torch.Tensor]:
         # This method needs a significant rewrite to handle per-kernel batching.
 
         # 1. Figure out what needs computing for each kernel
@@ -226,13 +273,13 @@ class HierarchicalSearchManager:
             # Get the batch size specific to this kernel, with a fallback to a global default.
             kernel_conf = self.config.get("kernel_configs", {}).get(kernel.kernel_name.lower(), {})
             batch_size = kernel_conf.get('max_batch_size', 1) # Default to 1 for safety
-           #print(f"[{self.worker_id}] Processing for {kernel_name} with batch size {batch_size}")
+            #print(f"[{self.worker_id}] Processing for {kernel_name} with batch size {batch_size}")
 
             for i in range(0, len(indices_to_compute), batch_size):
                 # Tell PyTorch to run this block of work on the kernel's dedicated stream
                 with torch.cuda.stream(stream):
                     batch_indices = indices_to_compute[i : i + batch_size]
-                    images_to_process = [frames_chunk[idx] for idx in batch_indices]
+                    images_to_process = frame_accessor.get_batch(batch_indices)
                     
                     latents_batch = kernel.get_latents_for_images(images_to_process)
                     for idx, latent in zip(batch_indices, latents_batch):
@@ -257,7 +304,7 @@ class HierarchicalSearchManager:
         Performs a single, sparse probe of a span and queues further work based on adaptive parameters.
         Returns a tuple of (keyframes_found_in_this_step, frames_processed_in_this_step).
         """
-        # --- 1. Determine search parameters based on "hotness" ---
+        # --- 1. Determine search parameters based on "hotness" (This part is fine) ---
         if is_hot:
             k_to_use = self.config.get("top_k", 2)
             max_d_to_use = self.config.get("max_d", 3)
@@ -265,10 +312,10 @@ class HierarchicalSearchManager:
             k_to_use = self.config.get("top_k_lazy", 1)
             max_d_to_use = self.config.get("max_d_lazy", 2)
 
-        # --- 2. Termination checks for this branch ---
+        # --- 2. Termination checks for this branch (This part is fine) ---
         if depth >= max_d_to_use:
             search_log.append({'type': 'terminate_branch', 'reason': 'max_depth_reached', 'depth': depth})
-            return [], 0 # Return no keyframes, 0 frames processed
+            return [], 0
 
         span_size = end_idx - start_idx + 1
         branching_factor = self.config['branching_factor']
@@ -297,14 +344,18 @@ class HierarchicalSearchManager:
             for kernel in self.kernels:
                 latents_slice = all_latents_by_kernel[kernel.kernel_name][[i, i+1]]
                 scores_tensor = kernel.tracker.get_novelty_scores(latents_slice)
-                is_novel_mask = kernel.tracker.is_novel(scores_tensor)
+                is_novel_mask, z_scores_tensor = kernel.tracker.is_novel(scores_tensor)
 
                 if is_novel_mask.any().item():
                     is_sub_span_hot = True
                     max_score_val = scores_tensor.max().item()
                     event_idx = sub_span_start if scores_tensor.argmax().item() == 0 else sub_span_end
-                    
-                    event = kernel.create_keyframe_event(timestamps_chunk[event_idx], max_score_val, "sparse_search_spike")
+                    # --- ADD: Extract the corresponding Z-score ---
+                    z_score_val = z_scores_tensor[event_idx_in_batch].item()
+                    event = kernel.create_keyframe_event(timestamps_chunk[event_idx],
+                        max_score_val,
+                        "sparse_search_spike", 
+                        z_score=z_score_val)
                     keyframes_found.append(event)
                 
                 highest_score_in_sub_span = max(highest_score_in_sub_span, scores_tensor.max().item())
@@ -314,14 +365,33 @@ class HierarchicalSearchManager:
                 'start': sub_span_start,
                 'end': sub_span_end,
                 'is_hot': is_sub_span_hot # Carry the "hot" status forward
+                
             })
         
-        # --- 5. Rank and queue the next steps ---
-        sub_spans_to_consider.sort(key=lambda x: x['score'], reverse=True)
-        for i in range(min(k_to_use, len(sub_spans_to_consider))):
-            span_to_queue = sub_spans_to_consider[i]
-            search_queue.append((span_to_queue['start'], span_to_queue['end'], depth + 1, span_to_queue['is_hot']))
-            search_log.append({'type': 'queue_sub_span', 'depth': depth + 1, 'is_hot': span_to_queue['is_hot'], 'score': span_to_queue['score']})
+            sub_spans_to_consider.sort(key=lambda x: x['score'], reverse=True)
+        
+        any_hot_spans_found = any(s['is_hot'] for s in sub_spans_to_consider)
+        
+        if any_hot_spans_found:
+            # --- Standard Path: At least one sub-span is interesting ---
+            # Explore the top `k_to_use` spans.
+            for i in range(min(k_to_use, len(sub_spans_to_consider))):
+                span_to_queue = sub_spans_to_consider[i]
+                search_queue.append((span_to_queue['start'], span_to_queue['end'], depth + 1, span_to_queue['is_hot']))
+                search_log.append({'type': 'queue_sub_span', 'depth': depth + 1, 'is_hot': span_to_queue['is_hot'], 'score': span_to_queue['score']})
+        else:
+            # --- "Pity Probe" Path: Nothing was hot, so we perform a LAZY search ---
+            # We use the _lazy parameters to ensure we gather some data without committing to a deep search.
+            lazy_k = self.config.get("top_k_lazy", 1)
+            lazy_max_d = self.config.get("max_d_lazy", 1)
+            
+            # We check the depth against the lazy depth limit.
+            if depth < lazy_max_d:
+                for i in range(min(lazy_k, len(sub_spans_to_consider))):
+                    span_to_queue = sub_spans_to_consider[i]
+                    # We queue the highest-scoring cold span and explicitly mark its children as `is_hot=False`.
+                    search_queue.append((span_to_queue['start'], span_to_queue['end'], depth + 1, False))
+                    search_log.append({'type': 'queue_lazy_probe', 'depth': depth + 1, 'score': span_to_queue['score']})
 
         return keyframes_found, frames_processed_this_step
 
@@ -329,7 +399,7 @@ class HierarchicalSearchManager:
         # Reset state for the new chunk
         self.latent_cache.clear()
         self.latents_from_search = {k.kernel_name: [] for k in self.kernels}
-        if not frames_chunk: return {'keyframes': [], 'search_log': []}
+        if len(frames_chunk) == 0: return {'keyframes': [], 'search_log': []}
 
         # --- 1. Setup search budget and initial state ---
         processing_budget = int(len(frames_chunk) * self.config.get("max_p", 0.33))
@@ -407,6 +477,7 @@ def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown
         kernels.append(OCRLatentKernel(config))
     
     search_manager = HierarchicalSearchManager(kernels, config)
+    preprocessor = lambda frame: _downscale_image(Image.fromarray(frame))
 
     while True:
         try:
@@ -414,21 +485,32 @@ def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown
             task = task_queue.get(timeout=0.1)
             if task is None: break
 
-            shm = shared_memory.SharedMemory(name=task['shm_name'])
-            buffer = np.ndarray(task['shape'], dtype=task['dtype'], buffer=shm.buf)
+            #shm = shared_memory.SharedMemory(name=task['shm_name'])
+            #buffer = np.ndarray(task['shape'], dtype=task['dtype'], buffer=shm.buf)
+            # doubled copy buffers? for no reason?
+            #frames_as_images = [Image.fromarray(frame) for frame in buffer]
+            #downscaled_images = [_downscale_image(img) for img in frames_as_images]
+
+            # --- LAZY INITIALIZATION ---
+            # Instantiate the accessor, injecting our defined preprocessor.
+            frame_accessor = LazyFrameAccessor(shm_name=task['shm_name'],
+                shape=task['shape'],
+                dtype=task['dtype'],
+                preprocess_fn=preprocessor)
             
-            frames_as_images = [Image.fromarray(frame) for frame in buffer]
-            downscaled_images = [_downscale_image(img) for img in frames_as_images]
-            
-            result_data = search_manager.process_chunk(downscaled_images, task['timestamps'], shutdown_event)
+            # The search manager now operates on the accessor, triggering
+            # lazy preprocessing for only the frames it needs.
+            result_data = search_manager.process_chunk(frame_accessor, task['timestamps'], shutdown_event)
             
             return_message = {
                 "shm_name": task['shm_name'], "shape": task['shape'],
                 "dtype": task['dtype'], "timestamps": task['timestamps'],
                 "source": "HierarchicalSearchManager", "data": result_data
             }
+            print(f"repr:{repr(result_data)}")
             return_queue.put(return_message)
-            shm.close()
+            #shm.close()
+            frame_accessor.close()
 
         except queue.Empty:
             continue

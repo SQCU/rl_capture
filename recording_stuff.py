@@ -31,8 +31,8 @@ RECORDING_WINDOW_NAME = "ATLYSS"
 CAPTURE_REGION = None
 OUTPUT_PATH = f"./capture_run_{int(time.time())}"
 CHUNK_SECONDS = 10  # How many seconds of frames to triage at a time
-CAPTURE_FPS = 30
-UNHANDLED_SHM_DEADLINE_SECONDS = 75.0 # Time before we declare a block abandoned
+CAPTURE_FPS = 60
+UNHANDLED_SHM_DEADLINE_SECONDS = 90.0 # Time before we declare a block abandoned
 MAX_PIPELINE_DEPTH = 15
 MIN_PIPELINE_DEPTH = 5
 KEYFRAME_PADDING_SECONDS = 0.5 # How many seconds before and after a keyframe to include in a clip
@@ -59,21 +59,21 @@ STRATEGY_CONFIGS = {
     "pca_mahalanobis": {
         "pca_n_components": 16,      # Max components (top-k guardrail).
         "pca_variance_threshold": 0.95, # The variance to capture (top-p).
-        "novelty_z_score_threshold": 0.5, # Z-score threshold for the Mahalanobis scores themselves.
+        "novelty_z_score_threshold": 0.1, # Z-score threshold for the Mahalanobis scores themselves.
         "branching_factor": 8, # Override the worker's default of 8
         "min_exhaustive_size": 8, # Override the worker's default of 16
         "max_batch_size": 8,
         "top_k": 3,          # Explore the top 2 sub-spans in a "hot" region.
-        "max_d": 3,          # Max recursion depth for "hot" regions.
+        "max_d": 4,          # Max recursion depth for "hot" regions.
         "top_k_lazy": 1,     # Explore only the top sub-span in a "cold" region.
-        "max_d_lazy": 1,     # Give up on "cold" regions faster.
+        "max_d_lazy": 2,     # Give up on "cold" regions faster.
         "max_p": 0.33,       # Hard budget: process at most 33% of total frames in a chunk.
         "kernel_configs": {
             "siglip": {
                 "max_batch_size": 8 # SigLIP is efficient
             },
             "ocr": {
-                "max_batch_size": 8   # OCR model is huge, process one by one
+                "max_batch_size": 4   # OCR model is huge, process one by one
             }
     }
 }
@@ -419,9 +419,11 @@ class Orchestrator:
             # --- MODIFICATION: Update status before processing ---
             with self.shm_lock:
                 if shm_name in self.active_shm_blocks:
-                    self.active_shm_blocks[shm_name]['status'] = 'encoding_pending'
+                    # We just heard from the worker. Reset the timeout clock for this block.
+                    self.active_shm_blocks[shm_name]['timestamp'] = time.time() 
+                    self.active_shm_blocks[shm_name]['status'] = 'processing_complete' # Update status
                 else:
-                    # This can happen if the block timed out and was already cleaned up
+                    # This can still happen if the worker was *extremely* slow, but it's much less likely.
                     print(f"Orchestrator: Received result for {shm_name}, but it's no longer active. Discarding.")
                     continue
 
@@ -543,16 +545,17 @@ class Orchestrator:
         with self.shm_lock:
             pipeline_depth = len(self.active_shm_blocks)
 
-        if pipeline_depth > self.max_pipeline_depth:
+        # Get the number of tasks waiting to even be started
+        pending_analysis_tasks = self.salience_task_queue.qsize()
+        total_backlog = pipeline_depth + pending_analysis_tasks
+
+        if total_backlog > self.max_pipeline_depth:
             # We are backlogged. Increase chunk size to reduce analysis overhead per second of video.
             if self.config['chunk_seconds'] < 20:
                 self.config['chunk_seconds'] += 1
                 print(f"PIPELINE BACKLOG DETECTED (depth: {pipeline_depth}). Increasing chunk size to {self.config['chunk_seconds']}s.")
-        elif pipeline_depth < self.min_pipeline_depth:
-            # We have spare capacity. Decrease chunk size for lower latency.
-            #if self.config['chunk_seconds'] > 5:
-            #    self.config['chunk_seconds'] -= 1
-            #    print(f"PIPELINE CAPACITY AVAILABLE (depth: {pipeline_depth}). Decreasing chunk size to {self.config['chunk_seconds']}s.")
+        elif total_backlog < self.min_pipeline_depth:
+            # We have spare capacity.
             pass
     def start_workers(self):
         """Creates and starts all the decoupled processes and threads."""

@@ -13,7 +13,7 @@ major missing features:
 ❔ - fix IPC resource leaks (can deadlock program then memory-lock ur entire system)
 - rewrite to use obs-studio virtual camera API for various kinds of user data hygeine (avoid ever seeing emails or directories if user alt-tabs)
 - audio capture (lol)
-- reimplement low-level-of-detail low-bitrate 'baseline recording'
+✅ reimplement low-level-of-detail low-bitrate 'baseline recording'
 - data viewer
 - rewrite to something like zeromq + trio so adding new features is less likely to crash your computer ;)
 - vc funding 

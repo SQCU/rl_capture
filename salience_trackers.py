@@ -171,7 +171,7 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
 
         # --- MODIFIED: The buffer can now hold GPU tensors directly. ---
         self.latent_buffer = []
-        self.fit_threshold = self.config['pca_n_components'] * 2
+        self.fit_threshold = self.config['pca_n_components']
 
     def update(self, latents_batch: torch.Tensor):
         """
@@ -238,54 +238,29 @@ class PCAMahanalobisTracker(BaseSalienceTracker):
         
         return torch.sqrt(sq_mahalanobis)
 
-    def is_novel(self, scores: torch.Tensor) -> torch.Tensor:
-        # --- GPU-NATIVE PART ---
+    def is_novel(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # --- MODIFIED: This method now returns a tuple (mask, z_scores) ---
+    
+    self.novelty_score_stats.update(scores.detach()[~torch.isnan(scores)])
+    mean, std_dev = self.novelty_score_stats.mean, self.novelty_score_stats.std_dev
+    
+    if std_dev == 0:
+        # If there's no variance, nothing is novel and Z-scores are all zero.
+        zeros = torch.zeros_like(scores, dtype=torch.bool)
+        return zeros, zeros.float()
 
-        # 1. Update stats with the new scores (happens on GPU).
-        self.novelty_score_stats.update(scores.detach()[~torch.isnan(scores)])
+    # --- EXPLICIT Z-SCORE CALCULATION ---
+    # Calculate the threshold for the boolean mask
+    threshold = mean + (std_dev * self.config['novelty_z_score_threshold'])
+    is_novel_mask = scores > threshold
 
-        # 2. Get the current mean and std_dev (still GPU tensors).
-        mean, std_dev = self.novelty_score_stats.mean, self.novelty_score_stats.std_dev
-        
-        # Handle the edge case of no variance yet.
-        if std_dev == 0:
-            return torch.zeros_like(scores, dtype=torch.bool)
+    # Calculate the Z-score for every item in the batch for logging
+    # Use a small epsilon to prevent division by zero, although the guard above should handle it.
+    z_scores = (scores - mean) / (std_dev + 1e-8)
+    
+    # ... (the conditional logging block can remain for debugging if you wish) ...
 
-        # 3. Calculate the threshold and the novelty mask (all on GPU).
-        threshold = mean + (std_dev * self.config['novelty_z_score_threshold'])
-        is_novel_mask = scores > threshold
-
-        # --- CPU-LOGGING PART (Only runs if needed) ---
-
-        # 4. Conditionally enter the logging block ONLY if a keyframe was detected.
-        #    This avoids expensive GPU->CPU transfers on every call.
-        if is_novel_mask.any():
-            
-            # 5. NOW, we perform the minimal necessary data transfers for printing.
-            cpu_scores = scores.detach().cpu().float().numpy()
-            cpu_mask = is_novel_mask.cpu().numpy()
-
-            # 6. Convert all GPU TENSORS to Python SCALARS before the loop.
-            threshold_val = threshold.item()
-            mean_val = mean.item()  # or self.novelty_score_stats.mean.item()
-            std_dev_val = std_dev.item() # or self.novelty_score_stats.std_dev.item()
-
-            # 7. Loop and print using the safe, scalar Python variables.
-            for i in np.where(cpu_mask)[0]:
-                score_val = cpu_scores[i]
-                
-                # Z-score is now calculated with pure Python floats.
-                z_score = (score_val - mean_val) / std_dev_val if std_dev_val > 0 else 0.0
-
-                """
-                #print(
-                    f"[PCATracker] KEYFRAME DETECTED! "
-                    f"Score: {score_val:.4f} > Threshold: {threshold_val:.4f} "
-                    f"(Mean: {mean_val:.4f}, StdDev: {std_dev_val:.4f}, Z-Score: {z_score:.2f})"
-                )
-                """
-        
-        return is_novel_mask
+    return is_novel_mask, z_scores
 
 # --- NEW: A factory dictionary to map config strings to classes ---
 TRACKER_STRATEGIES = {
