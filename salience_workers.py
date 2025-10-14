@@ -15,6 +15,7 @@ import gc
 from typing import Callable
 
 # --- NEW: Import our new tracker classes ---
+from hyperparameter_schedulers import ConfigScheduler
 from salience_trackers import NaiveZScoreTracker, PCAMahanalobisTracker, TRACKER_STRATEGIES
 
 class LazyFrameAccessor:
@@ -272,7 +273,6 @@ class SearchAgent:
             self.work_queue.clear()
             return False 
         if len(self.pending_results) >= 4: return False
-        #max 4 in-flight operations
         self._poll_event_context()
         if not self.work_queue: return False
         
@@ -288,32 +288,54 @@ class SearchAgent:
             return False
         
         sentinel_indices = np.linspace(start_idx, end_idx, branching_factor, dtype=int).tolist()
-        # --- NEW: Increment the counter ---
         self.frames_processed += len(sentinel_indices)
 
         with torch.cuda.stream(self.stream):
             images = self.frame_accessor.get_batch(sentinel_indices)
-            latents = self.kernel.get_latents_for_images(images)
-            latents_cpu = latents.to('cpu', non_blocking=True)
+            
+            # --- STAGE 1: GPU WORK ---
+            # Get latents and immediately calculate scores and novelty.
+            # This keeps everything on the GPU until all calculations are done.
+            latents_gpu = self.kernel.get_latents_for_images(images)
+            scores = self.kernel.tracker.get_novelty_scores(latents_gpu)
+            is_novel_mask, z_scores = self.kernel.tracker.is_novel(scores)
+            
+            # --- STAGE 2: ASYNC CPU TRANSFER ---
+            # Now, move the original latents to the CPU for the end-of-chunk
+            # statistical update. This happens in the background.
+            latents_cpu = latents_gpu.to('cpu', non_blocking=True)
         
+        # --- STAGE 3: QUEUE RESULTS ---
+        # The pending result now includes the pre-calculated scores and masks.
         self.pending_results.append({
-            'sentinel_indices': sentinel_indices, 'latents': latents_cpu,
+            'sentinel_indices': sentinel_indices, 
+            'latents_for_update': latents_cpu, # Keep CPU version for the update list
+            'scores': scores,
+            'is_novel_mask': is_novel_mask,
+            'z_scores': z_scores,
             'start_idx': start_idx, 'end_idx': end_idx, 'depth': depth,
             'is_hot': is_hot, 'k_to_use': k_to_use
         })
         return True
     
     def poll_results(self):
+        """
+        --- REFACTORED FOR EFFICIENCY ---
+        Processes results from the GPU. It no longer needs to move data back to
+        the GPU as the novelty scores have already been calculated.
+        """
         if not self.pending_results or not self.stream.query():
-            return False # --- FIX: Signal that no results were processed ---
+            return False
         
         result = self.pending_results.popleft()
-        latents_cpu = result['latents']
-        latents_gpu = latents_cpu.to(self.kernel.device)
-        scores = self.kernel.tracker.get_novelty_scores(latents_gpu)
-        is_novel_mask, z_scores = self.kernel.tracker.is_novel(scores)
         
-        self.computed_latents_for_update.append(latents_gpu)
+        # --- MODIFICATION: Directly use the pre-calculated results ---
+        scores = result['scores']
+        is_novel_mask = result['is_novel_mask']
+        z_scores = result['z_scores']
+        
+        # --- FIX: This now correctly appends a CPU tensor, preventing VRAM leaks ---
+        self.computed_latents_for_update.append(result['latents_for_update'])
         
         sub_spans = []
         for i in range(len(result['sentinel_indices']) - 1):
@@ -325,13 +347,17 @@ class SearchAgent:
             
             if is_novel:
                 event_idx_in_batch = i if z_scores[i] > z_scores[i+1] else i + 1
-                event = {
-                    "source_kernel": self.kernel.kernel_name,
-                    "timestamp": self.timestamps[result['sentinel_indices'][event_idx_in_batch]],
-                    "score": scores[event_idx_in_batch].item(),
-                    "z_score": z_scores[event_idx_in_batch].item(),
-                }
-                self.event_context.publish(z_scores[event_idx_in_batch].item(), event)
+                # Use the pre-calculated z_score directly from the result
+                z_score_value = z_scores[event_idx_in_batch].item()
+                # --- FIX: Use the novelty threshold from the agent's current config ---
+                if z_score_value > self.config.get('novelty_z_score_threshold', 0.1):
+                    event = {
+                        "source_kernel": self.kernel.kernel_name,
+                        "timestamp": self.timestamps[result['sentinel_indices'][event_idx_in_batch]],
+                        "score": scores[event_idx_in_batch].item(),
+                        "z_score": z_score_value,
+                    }
+                    self.event_context.publish(z_score_value, event)
         
         sub_spans.sort(key=lambda x: x['z_score'], reverse=True)
         k = result['k_to_use'] if any(s['is_hot'] for s in sub_spans) else self.config.get("top_k_lazy", 1)
@@ -345,10 +371,28 @@ class HierarchicalSearchCoordinator:
         self.kernels = kernels
         self.config = config
         self.streams = {k.kernel_name: torch.cuda.Stream() for k in kernels}
+
+        # FIX: Instantiate the scheduler so it can be used.
+        if "scheduled_hyperparams" in self.config:
+            self.scheduler = ConfigScheduler(self.config["scheduled_hyperparams"])
+        else:
+            self.scheduler = None
     
     def process_chunk(self, frame_accessor: LazyFrameAccessor, timestamps_chunk: list, shutdown_event: Event, progress_queue: Queue) -> dict:
         event_context = EventContext()
         agents = []
+        
+        if self.scheduler:
+            scheduled_values = self.scheduler.get_current_values()
+            print(f"Coordinator (step {self.scheduler.current_step}): Using scheduled params: {scheduled_values}")
+            self.config.update(scheduled_values)
+            self.scheduler.step()
+
+            # --- FIX: Propagate updated config to each kernel's tracker ---
+            # This ensures the `is_novel` method uses the correct z-score threshold.
+            for kernel in self.kernels:
+                kernel.tracker.update_config(scheduled_values)
+            
         for kernel in self.kernels:
             agent_config = self.config.copy()
             kernel_specific_config = self.config.get("kernel_configs", {}).get(kernel.kernel_name.lower(), {})
@@ -386,8 +430,12 @@ class HierarchicalSearchCoordinator:
         
         for agent in agents:
             if agent.computed_latents_for_update:
-                all_latents = torch.cat(agent.computed_latents_for_update, dim=0)
-                agent.kernel.tracker.update(all_latents)
+                # 1. Concatenate all CPU tensors into one large CPU tensor.
+                all_latents_cpu = torch.cat(agent.computed_latents_for_update, dim=0)
+                # 2. Move the entire batch to the GPU in one efficient transfer.
+                all_latents_gpu = all_latents_cpu.to(agent.kernel.device)
+                # 3. Update the tracker model.
+                agent.kernel.tracker.update(all_latents_gpu)
         
         final_keyframes = []
         # --- MODIFIED: Unpack the 3-element tuple blocking heapq deadlocks ---

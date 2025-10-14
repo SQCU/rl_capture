@@ -80,16 +80,12 @@ class BaseSalienceTracker:
         self.config = config
         self.device = config['device']
 
+    def update_config(self, new_config: dict):
+        """Updates the internal configuration with new values."""
+        self.config.update(new_config)
+
     def update(self, latents_batch: np.ndarray):
         """Update the internal state of the tracker with a new batch of latents."""
-        raise NotImplementedError
-
-    def get_novelty_scores(self, latents_batch: np.ndarray) -> np.ndarray:
-        """Calculate a novelty score for each latent in a batch."""
-        raise NotImplementedError
-
-    def is_novel(self, scores: np.ndarray) -> np.ndarray:
-        """Given a batch of scores, return a boolean mask of which are novel."""
         raise NotImplementedError
 
 class NaiveZScoreTracker(BaseSalienceTracker):
