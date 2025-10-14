@@ -33,7 +33,7 @@ CAPTURE_REGION = None
 OUTPUT_PATH = f"./capture_run_{int(time.time())}"
 CHUNK_SECONDS = 10  # How many seconds of frames to triage at a time
 CAPTURE_FPS = 60
-UNHANDLED_SHM_DEADLINE_SECONDS = 120.0 # Time before we declare a block abandoned
+UNHANDLED_SHM_DEADLINE_SECONDS = 150.0 # Time before we declare a block abandoned
 MAX_PIPELINE_DEPTH = 15
 MIN_PIPELINE_DEPTH = 5
 KEYFRAME_PADDING_SECONDS = 0.5 # How many seconds before and after a keyframe to include in a clip
@@ -82,7 +82,7 @@ STRATEGY_CONFIGS = {
 SCHEDULED_HYPERPARAMS = {
     "max_p": {
         "initial_value": 0.05,   # Start with a modest 5% search budget...
-        "sustain_value": 0.33,   # ...and ramp up to the sustained 33% budget.
+        "sustain_value": 0.12,   # need an extremely light encoder which finishes super fast to use ~1/3 max_p
         "warmup_steps": 2,       # Hold the initial value for the first 2 chunks.
         "ramp_steps": 24,        # Linearly ramp up over the next 12 chunks (2 minutes @ 10s/chunk).
     },
