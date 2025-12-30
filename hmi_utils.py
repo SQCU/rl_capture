@@ -15,6 +15,55 @@ import pynput
 import orjson
 from PIL import Image # <--- for framearchiver.
 # claude hates the unfocused general purpose keylogger, they RLHFed that fellow to shreds
+
+def _detect_h264_encoder() -> tuple[str, dict]:
+    """
+    Detect which H.264 encoder is available in ffmpeg.
+    Returns (encoder_name, encoder_options) for best available encoder.
+
+    Priority:
+    1. h264_nvenc (NVIDIA GPU, fast, good quality)
+    2. h264_amf (AMD GPU, fast)
+    3. h264_qsv (Intel QuickSync)
+    4. libx264 (CPU, best quality but not always available)
+    5. h264_mf (Windows Media Foundation, always available on Windows)
+    """
+    # Get list of available encoders from ffmpeg
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            capture_output=True, text=True, timeout=10
+        )
+        available_encoders = result.stdout if result.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        available_encoders = ""
+
+    # List of encoders to try in priority order (GPU first for speed)
+    candidates = [
+        ('h264_nvenc', {'preset': 'p4'}),  # NVIDIA - fast, good quality
+        ('h264_amf', {}),                   # AMD
+        ('h264_qsv', {}),                   # Intel QuickSync
+        ('libx264', {'preset': 'fast'}),   # CPU fallback, best quality
+        ('h264_mf', {}),                    # Windows Media Foundation
+    ]
+
+    for encoder, opts in candidates:
+        if encoder in available_encoders:
+            print(f"[VideoEncoder] Using H.264 encoder: {encoder}")
+            return encoder, opts
+
+    # Last resort: just try h264_mf on Windows, it should always work
+    print("[VideoEncoder] WARNING: Could not detect encoders, trying h264_mf")
+    return 'h264_mf', {}
+
+# Cache the encoder detection result
+_H264_ENCODER = None
+def get_h264_encoder() -> tuple[str, dict]:
+    global _H264_ENCODER
+    if _H264_ENCODER is None:
+        _H264_ENCODER = _detect_h264_encoder()
+    return _H264_ENCODER
+
 class FocusTracker:
     """Tracks which window currently has focus."""
     def __init__(self, target_window_name: str):
@@ -370,21 +419,38 @@ class VideoEncoder:
         # --- FIX: Build a video filter chain to ensure even dimensions ---
         filter_chain = ["crop=trunc(iw/2)*2:trunc(ih/2)*2"]
 
+        # Get the detected encoder
+        encoder, encoder_opts = get_h264_encoder()
+
         if quality == 'HIGH':
             crf = 20
-            preset = 'fast'
         else: # VERY_LOW
             crf = 35
-            preset = 'ultrafast'
             # Also ensure the downscaled resolution is even
             out_w = (width // 4) - ((width // 4) % 2)
             out_h = (height // 4) - ((height // 4) % 2)
             filter_chain.append(f"scale={out_w}:{out_h}")
 
+        # Build encoder-specific options
+        encoder_args = ['-c:v', encoder]
+        if 'preset' in encoder_opts:
+            encoder_args += ['-preset', encoder_opts['preset'] if quality == 'HIGH' else 'ultrafast']
+        elif encoder == 'h264_nvenc':
+            encoder_args += ['-preset', 'p4' if quality == 'HIGH' else 'p1']
+        # CRF/quality setting (varies by encoder)
+        if encoder == 'libx264':
+            encoder_args += ['-crf', str(crf)]
+        elif encoder in ('h264_nvenc', 'h264_amf', 'h264_qsv'):
+            encoder_args += ['-cq', str(crf)]  # Constant quality mode
+        elif encoder == 'h264_mf':
+            # Media Foundation uses bitrate, estimate from CRF
+            bitrate = 8000 if quality == 'HIGH' else 2000
+            encoder_args += ['-b:v', f'{bitrate}k']
+
         command = [
             'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
             '-s', f'{width}x{height}', '-pix_fmt', 'rgb24', '-r', str(avg_fps),
-            '-i', '-', '-c:v', 'libx264', '-preset', preset, '-crf', str(crf),
+            '-i', '-', *encoder_args,
             '-vf', ",".join(filter_chain), # Apply the filter chain
             '-pix_fmt', 'yuv420p', output_filepath,
         ]
@@ -418,9 +484,14 @@ class VideoEncoder:
     def start_continuous_encode(self, dimensions: tuple, fps: int) -> (subprocess.Popen, io.BufferedWriter):
         """
         Launches a persistent ffmpeg process for a continuous, low-quality recording.
-        
+
+        IMPORTANT: This encoder expects frames at the specified fps. If your capture
+        runs at a different rate (e.g., 165Hz), you must decimate frames BEFORE
+        feeding them to this encoder. Use get_decimated_frames_for_baseline() from
+        paged_memory.py to properly decimate.
+
         Returns:
-            A tuple containing the Popen object and its stdin pipe.
+            A tuple containing the Popen object, its stdin pipe, and stderr pipe.
         """
         height, width, _ = dimensions
         output_filename = f"baseline_record_{time.time():.0f}.mp4"
@@ -428,7 +499,6 @@ class VideoEncoder:
 
         # A very low quality but fast configuration for the baseline
         crf = 38  # Higher CRF is lower quality, smaller file. 38 is quite low.
-        preset = 'ultrafast' # Prioritize low CPU usage
         # Downscale to a 'potato quality' resolution like 480p
         height_out = 480
         width_out = int(width * (height_out / height))
@@ -440,17 +510,32 @@ class VideoEncoder:
             f"scale={width_out}:{height_out}"
         ]
 
+        # Get the detected encoder
+        encoder, encoder_opts = get_h264_encoder()
+
+        # Build encoder-specific options (ultrafast for baseline)
+        encoder_args = ['-c:v', encoder]
+        if encoder == 'libx264':
+            encoder_args += ['-preset', 'ultrafast', '-crf', str(crf)]
+        elif encoder == 'h264_nvenc':
+            encoder_args += ['-preset', 'p1', '-cq', str(crf)]  # p1 = fastest
+        elif encoder in ('h264_amf', 'h264_qsv'):
+            encoder_args += ['-cq', str(crf)]
+        elif encoder == 'h264_mf':
+            encoder_args += ['-b:v', '1000k']  # Low bitrate for baseline
+
         command = [
             'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
             '-s', f'{width}x{height}', '-pix_fmt', 'rgb24', '-r', str(fps),
-            '-i', '-', '-an', '-c:v', 'libx264', '-preset', preset, '-crf', str(crf),
-            '-vf', ",".join(filter_chain), # Apply the filter chain
+            '-i', '-', '-an', *encoder_args,
+            '-vf', ",".join(filter_chain),
+            '-r', str(fps),  # Output at same fps as input (already decimated)
             '-pix_fmt', 'yuv420p', output_filepath,
         ]
 
-        print(f"Starting continuous baseline recording to {output_filepath} at {width_out}:{height_out}...")
+        print(f"Starting continuous baseline recording to {output_filepath} at {width_out}:{height_out} @ {fps}fps...")
         proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        
+
         # Set low priority to not interfere with the game or capture
         ps_proc = psutil.Process(proc.pid)
         ps_proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS) # For Windows
@@ -458,6 +543,91 @@ class VideoEncoder:
 
         # We don't add this to self.active_processes because it has a special shutdown lifecycle
         return proc, proc.stdin, proc.stderr
+
+    def encode_decimated_page(self, frames: np.ndarray, timestamps: np.ndarray, actual_fps: float) -> subprocess.Popen:
+        """
+        Encode a batch of PRE-DECIMATED frames from a page.
+
+        This is the NEW preferred method for baseline encoding in the paged memory model.
+        Frames have already been decimated to the target framerate, and actual_fps
+        reflects the true framerate of the decimated data.
+
+        Args:
+            frames: Decimated frame data (N, H, W, 3)
+            timestamps: Timestamps for each frame
+            actual_fps: The actual framerate of the decimated frames
+
+        Returns:
+            The ffmpeg Popen process (caller should wait for completion)
+        """
+        if len(frames) == 0:
+            return None
+
+        height, width, _ = frames[0].shape
+        output_filename = f"baseline_page_{timestamps[0]:.2f}.mp4"
+        output_filepath = os.path.join(self.output_path, "videos", output_filename)
+
+        # Low quality baseline settings
+        crf = 38
+
+        # Downscale to 480p
+        height_out = 480
+        width_out = int(width * (height_out / height))
+        if width_out % 2 != 0: width_out += 1
+
+        filter_chain = [
+            "crop=trunc(iw/2)*2:trunc(ih/2)*2",
+            f"scale={width_out}:{height_out}"
+        ]
+
+        # Get the detected encoder
+        encoder, encoder_opts = get_h264_encoder()
+
+        # Build encoder-specific options
+        encoder_args = ['-c:v', encoder]
+        if encoder == 'libx264':
+            encoder_args += ['-preset', 'ultrafast', '-crf', str(crf)]
+        elif encoder == 'h264_nvenc':
+            encoder_args += ['-preset', 'p1', '-cq', str(crf)]
+        elif encoder in ('h264_amf', 'h264_qsv'):
+            encoder_args += ['-cq', str(crf)]
+        elif encoder == 'h264_mf':
+            encoder_args += ['-b:v', '1000k']
+
+        # Use the ACTUAL fps from the decimated data
+        command = [
+            'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}', '-pix_fmt', 'rgb24',
+            '-r', f'{actual_fps:.2f}',  # Input fps from actual timestamp deltas
+            '-i', '-',
+            '-an', *encoder_args,
+            '-vf', ",".join(filter_chain),
+            '-r', f'{actual_fps:.2f}',  # Output same as input (no frame rate conversion)
+            '-pix_fmt', 'yuv420p',
+            output_filepath,
+        ]
+
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        # Set low priority
+        try:
+            ps_proc = psutil.Process(proc.pid)
+            ps_proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)  # Windows
+        except Exception:
+            pass
+
+        # Write frames in a thread to avoid blocking
+        def pipe_frames():
+            try:
+                contiguous_frames = np.ascontiguousarray(frames)
+                proc.stdin.write(contiguous_frames.tobytes())
+            except (IOError, BrokenPipeError):
+                pass
+            finally:
+                proc.stdin.close()
+
+        Thread(target=pipe_frames).start()
+        return proc
 
     def shutdown_all(self):
         with self.lock:

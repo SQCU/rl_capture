@@ -25,20 +25,44 @@ import psutil
 # We now need one of the salience workers in the Triage process itself
 import salience_workers as sal_wo
 from window_utils import get_window_finder, WindowNotFoundError
-import hmi_utils #breaking off gui and keylog capture into an import 
+import hmi_utils #breaking off gui and keylog capture into an import
+
+# OBS-based capture (preferred over fragile window title matching)
+try:
+    from obs_capture import CaptureManager, obs_capture_process_loop
+    OBS_AVAILABLE = True
+except ImportError:
+    OBS_AVAILABLE = False
+    print("NOTE: obs_capture not available, using legacy window capture") 
 
 # --- Configuration ---
-RECORDING_WINDOW_NAME = "ATLYSS"
+#RECORDING_WINDOW_NAME = "Yunyun Syndrome!? Rhythm Psychosis Demo Version 1.0.1"
+RECORDING_WINDOW_NAME = "Sulfur"
 CAPTURE_REGION = None
 OUTPUT_PATH = f"./capture_run_{int(time.time())}"
-CHUNK_SECONDS = 10  # How many seconds of frames to triage at a time
 CAPTURE_FPS = 60
-UNHANDLED_SHM_DEADLINE_SECONDS = 150.0 # Time before we declare a block abandoned
-MAX_PIPELINE_DEPTH = 15
-MIN_PIPELINE_DEPTH = 5
+
+# --- PAGED MEMORY MODEL ---
+# Small pages for fast eviction decisions (was 12s chunks)
+from paged_memory import (
+    PAGE_SECONDS, PAGE_FRAMES_AT_60FPS, COARSE_TRIAGE_SENTINELS,
+    COARSE_TRIAGE_NOVELTY_THRESHOLD, FINE_REFINEMENT_MAX_P,
+    MAX_RETAINED_PAGES, MAX_PENDING_TRIAGE, BASELINE_TARGET_FPS,
+    PageState, PageMetadata, GlobalScheduler, WorkType, WorkItem,
+    create_page_from_frames, get_decimated_frames_for_baseline
+)
+
+PAGE_DEADLINE_SECONDS = 30.0  # Much shorter deadline for small pages
 KEYFRAME_PADDING_SECONDS = 0.5 # How many seconds before and after a keyframe to include in a clip
-# --- NEW: Triage Configuration ---
-TRIAGE_THRESHOLD = 0.1 # A starting point for max_delta to trigger deep analysis
+
+# Legacy compatibility (will be removed)
+CHUNK_SECONDS = PAGE_SECONDS
+UNHANDLED_SHM_DEADLINE_SECONDS = PAGE_DEADLINE_SECONDS
+MAX_PIPELINE_DEPTH = MAX_RETAINED_PAGES + MAX_PENDING_TRIAGE
+MIN_PIPELINE_DEPTH = 2
+
+# --- Triage Configuration ---
+TRIAGE_THRESHOLD = COARSE_TRIAGE_NOVELTY_THRESHOLD
 
 # --- NEW: Salience Strategy Configuration ---
 # Choose which algorithm to use for novelty detection.
@@ -88,9 +112,9 @@ SCHEDULED_HYPERPARAMS = {
     },
     "novelty_z_score_threshold": {
         "initial_value": 0.75,   # Start with a higher threshold (less sensitive)...
-        "sustain_value": 0.1,    # ...and ramp down to the normal, more sensitive value.
+        "sustain_value": 0.01,    # ...and ramp down to the normal, more sensitive value.
         "warmup_steps": 4,       # Hold for 4 chunks.
-        "ramp_steps": 16,        # Ramp down over the next 8 chunks.
+        "ramp_steps": 24,        # Ramp down over the next 8 chunks.
     }
 }
 
@@ -300,7 +324,12 @@ def capture_process_loop(raw_frame_queue: Queue, config: dict, shutdown_event: E
                         stderr_reader_thread.start()
 
                     # --- 4. STEADY-STATE OPERATION ---
-                    raw_frame_queue.put_nowait((start_time, frame_rgb))
+                    try:
+                        raw_frame_queue.put_nowait((start_time, frame_rgb))
+                    except queue.Full:
+                        # This is now a recoverable condition, not a fatal error.
+                        print(f"[{pid}] WARNING: raw_frame_queue is full. Dropping a frame.")
+                        pass # Continue the loop without crashing
                     if stdin_writer_thread:
                         try:
                             baseline_write_queue.put_nowait(frame_rgb)
@@ -322,84 +351,144 @@ def capture_process_loop(raw_frame_queue: Queue, config: dict, shutdown_event: E
         _finalize_encoder()
         print(f"[{pid}] Capture process finished.")
 
-def _stage_and_dispatch_chunk(frames: list, timestamps: list, salience_task_queue: Queue, shm_notification_queue: Queue):
+def _stage_and_dispatch_page(frames: list, timestamps: list, page_queue: Queue, baseline_queue: Queue, shm_registry: dict):
     """
-    Handles the creation of a shared memory block, copying frame data into it,
-    and dispatching the necessary tasks to the salience workers and orchestrator.
+    Handles the creation of a PAGE (small memory block), copying frame data into it,
+    and dispatching to both triage and baseline encoding queues.
+
+    Key difference from old chunk model:
+    - Pages are small (1.5s instead of 12s)
+    - Pages feed BOTH triage AND baseline encoder (no duplication)
+    - Decimated frames are extracted here for baseline encoding
+
+    IMPORTANT: shm_registry is used to keep SHM handles alive on Windows!
+    Without this, Python garbage collects the handle when this function returns,
+    causing the SHM to be destroyed before other processes can access it.
     """
     try:
-        # 1. Prepare SHM block parameters
-        buffer_shape = (len(frames), *frames[0].shape)
-        buffer_size = int(np.prod(buffer_shape) * np.dtype(np.uint8).itemsize)
-        shm_name = f"salience_chunk_{uuid.uuid4()}"
+        # 1. Create the page using the paged memory model
+        page, shm = create_page_from_frames(frames, timestamps)
 
-        # 2. Create the block and copy data
-        shm = shared_memory.SharedMemory(name=shm_name, create=True, size=buffer_size)
-        shm_buffer = np.ndarray(buffer_shape, dtype=np.uint8, buffer=shm.buf)
-        np.copyto(shm_buffer, np.array(frames))
+        # 2. Extract decimated frames for baseline encoder BEFORE dispatching
+        #    This happens synchronously to avoid SHM lifetime issues
+        decimated_frames, decimated_timestamps = get_decimated_frames_for_baseline(
+            shm_name=page.shm_name,
+            shape=page.shape,
+            dtype=page.dtype,
+            timestamps=page.timestamps,
+            target_fps=BASELINE_TARGET_FPS
+        )
 
-        # 3. Create the task for the salience workers
-        task = {
-            "shm_name": shm_name,
-            "shape": buffer_shape,
-            "dtype": np.uint8,
-            "timestamps": list(timestamps)
+        # 3. Dispatch page metadata to triage queue (the page_queue is for GlobalScheduler)
+        page_task = {
+            "page_id": page.page_id,
+            "shm_name": page.shm_name,
+            "shape": page.shape,
+            "dtype": page.dtype,
+            "timestamps": page.timestamps,
+            "page_metadata": page,
         }
-        
-        # 4. Dispatch tasks to the respective queues
-        salience_task_queue.put(task)
-        shm_notification_queue.put(shm_name)
+        page_queue.put(page_task)
 
-        # 5. Close our local handle. The Orchestrator now owns the block.
-        shm.close()
+        # 4. Dispatch baseline encoding task (metadata only - encoder reads from SHM)
+        #    We pass SHM info instead of copying frames through the queue.
+        #    The baseline encoder will read and decimate directly from SHM.
+        baseline_task = {
+            "page_id": page.page_id,
+            "shm_name": page.shm_name,
+            "shape": page.shape,
+            "dtype": "uint8",  # Always uint8 for frame data
+            "timestamps": list(page.timestamps),
+        }
+        baseline_queue.put(baseline_task)
+
+        # 5. Store handle in registry to keep it alive!
+        # On Windows, SharedMemory is reference-counted. If we let the handle go
+        # out of scope (garbage collected), the SHM is destroyed before the
+        # orchestrator can open it. Store in registry to keep alive.
+        shm_registry[page.page_id] = shm
 
     except Exception as e:
-        print(f"[Dispatcher] CRITICAL ERROR during chunk dispatch: {e}")
-        # Attempt to clean up a partially created SHM block if something went wrong
+        print(f"[Dispatcher] CRITICAL ERROR during page dispatch: {e}")
+        import traceback; traceback.print_exc()
+        # On error, we DO need to clean up since orchestrator won't receive the page
         if 'shm' in locals() and shm:
-            shm.close()
             try:
-                shm.unlink() # This might fail if it was never fully created, that's okay.
-            except FileNotFoundError:
+                shm.close()
+                shm.unlink()
+            except (FileNotFoundError, BufferError):
                 pass
 
-def dispatcher_loop(raw_frame_queue: Queue, salience_task_queue: Queue, shm_notification_queue: Queue, config: dict, shutdown_event: Event):
+
+# Legacy wrapper for compatibility
+def _stage_and_dispatch_chunk(frames: list, timestamps: list, salience_task_queue: Queue, shm_notification_queue: Queue):
+    """DEPRECATED: Use _stage_and_dispatch_page instead."""
+    # Create a dummy baseline queue and registry (for legacy code paths)
+    class DummyQueue:
+        def put(self, x): pass
+    _legacy_shm_registry = {}  # Will leak handles, but legacy code is deprecated anyway
+    _stage_and_dispatch_page(frames, timestamps, salience_task_queue, DummyQueue(), _legacy_shm_registry)
+    # Also notify the old shm_notification_queue for legacy orchestrator
+    # (This will be removed once PagedOrchestrator is fully integrated)
+
+
+def dispatcher_loop(raw_frame_queue: Queue, page_queue: Queue, baseline_queue: Queue, config: dict, shutdown_event: Event):
     """
-    The Dispatcher: A "dumb" process that only buffers frames, stages them
-    to shared memory, and puts a generic analysis task on the queue.
-    It performs ZERO analysis itself.
+    The Paged Dispatcher: Buffers frames into small PAGES (1.5s instead of 12s chunks)
+    and dispatches them to both:
+    1. Triage queue (for salience analysis)
+    2. Baseline queue (for continuous low-quality recording)
+
+    Key insight: Pages are small enough that eviction decisions happen fast.
+    Most pages are boring and can be dropped after baseline encoding.
     """
     worker_pid = os.getpid()
-    print(f"[{worker_pid}] Dispatcher started.")
+    print(f"[{worker_pid}] Paged Dispatcher started (page_size={PAGE_SECONDS}s, {PAGE_FRAMES_AT_60FPS} frames)")
 
-    frames_per_chunk = int(config['chunk_seconds'] * config['capture_fps'])
-    frame_buffer = deque(maxlen=frames_per_chunk)
+    frames_per_page = int(config.get('page_seconds', PAGE_SECONDS) * config['capture_fps'])
+    frame_buffer = deque(maxlen=frames_per_page)
+
+    # CRITICAL: Keep SHM handles alive on Windows!
+    # Without this registry, handles get garbage collected when _stage_and_dispatch_page
+    # returns, destroying the SHM before the orchestrator can access it.
+    shm_registry = {}
+
+    pages_dispatched = 0
 
     while not shutdown_event.is_set():
         try:
             timestamp, frame = raw_frame_queue.get(timeout=0.1)
             frame_buffer.append((timestamp, frame))
 
-            # --- MODIFIED: The logic is now radically simpler ---
-            if len(frame_buffer) == frames_per_chunk:
-                #print(f"[{worker_pid}] Dispatcher: Staging {len(frame_buffer)}-frame chunk for analysis.")
-                
+            if len(frame_buffer) == frames_per_page:
                 timestamps, frames = zip(*frame_buffer)
-                
-                # The dispatcher's ONLY job is to stage the data and create a generic task.
-                _stage_and_dispatch_chunk(
-                    frames=list(frames), 
-                    timestamps=list(timestamps), 
-                    salience_task_queue=salience_task_queue, 
-                    shm_notification_queue=shm_notification_queue
+
+                _stage_and_dispatch_page(
+                    frames=list(frames),
+                    timestamps=list(timestamps),
+                    page_queue=page_queue,
+                    baseline_queue=baseline_queue,
+                    shm_registry=shm_registry
                 )
-                
+
+                pages_dispatched += 1
+                if pages_dispatched % 10 == 0:
+                    print(f"[{worker_pid}] Dispatched {pages_dispatched} pages (holding {len(shm_registry)} SHM handles)")
+
                 frame_buffer.clear()
 
         except queue.Empty:
             continue
 
-    print(f"[{worker_pid}] Dispatcher finished.")
+    # Cleanup: close all SHM handles on shutdown
+    print(f"[{worker_pid}] Paged Dispatcher shutting down, releasing {len(shm_registry)} SHM handles...")
+    for page_id, shm in shm_registry.items():
+        try:
+            shm.close()
+        except Exception:
+            pass
+
+    print(f"[{worker_pid}] Paged Dispatcher finished. Total pages: {pages_dispatched}")
 
 class Orchestrator:
     """
@@ -414,7 +503,8 @@ class Orchestrator:
         self.num_encoding_workers = 2
 
         # --- NEW: A set of specialized queues for a decoupled system ---
-        self.raw_frame_queue = Queue(maxsize=config['capture_fps'] * 3) # Buffer 3s of raw frames
+        self.raw_frame_queue_max_size = config['capture_fps'] * 3
+        self.raw_frame_queue = Queue(maxsize=self.raw_frame_queue_max_size) # Buffer 3s of raw frames
         self.salience_task_queue = Queue()
         self.salience_results_queue = Queue()
         self.encoding_task_queue = Queue()
@@ -444,6 +534,37 @@ class Orchestrator:
         self.threads = []
         self.logger = ProgressLogger()
 
+        # --- NEW: Add a timer for periodic status logging ---
+        self.last_log_time = time.time()
+        self.log_interval_seconds = 4.0 # Log status every 4 seconds
+
+    def _log_pipeline_status(self):
+        """Prints a comprehensive, single-line status of all major queues."""
+        now = time.time()
+        if (now - self.last_log_time) < self.log_interval_seconds:
+            return
+
+        with self.shm_lock:
+            active_chunks = len(self.active_shm_blocks)
+
+        # Using qsize() is generally safe for logging/monitoring purposes
+        pending_salience = self.salience_task_queue.qsize()
+        buffered_raw_frames = self.raw_frame_queue.qsize()
+        max_raw_frames = self.raw_frame_queue_max_size
+        pending_encodes = self.encoding_task_queue.qsize()
+
+        status_line = (
+            f"[Pipeline Status] "
+            f"Active Chunks: {active_chunks} | "
+            f"Pending Salience: {pending_salience} | "
+            f"Raw Frames: {buffered_raw_frames}/{max_raw_frames} | "
+            f"Pending Encodes: {pending_encodes}"
+        )
+
+        # Use the ProgressLogger to avoid spamming the console with newlines
+        self.logger.log("pipeline_status", status_line)
+        self.last_log_time = now
+
     def start(self):
         """Starts all worker processes and the main orchestration loop."""
         self.start_workers()
@@ -466,6 +587,9 @@ class Orchestrator:
                 self.audit_shm_blocks()
                 # 5. NEW: Adjust pipeline parameters based on load
                 self.adapt_pipeline()
+
+                # --- NEW: Call the status logger on every loop ---
+                self._log_pipeline_status()
                 
                 time.sleep(0.012)
 
@@ -473,7 +597,7 @@ class Orchestrator:
             self.is_running = False
         finally:
             self.shutdown()
-    
+
     def process_salience_results_queue(self):
         """
         Processes keyframe events and search logs from a salience worker.
@@ -657,8 +781,16 @@ class Orchestrator:
     def start_workers(self):
         """Creates and starts all the decoupled processes and threads."""
         # --- Start Processes ---
+        # Capture process - use OBS if preferred and available
+        if self.config.get('prefer_obs') and OBS_AVAILABLE:
+            capture_target = obs_capture_process_loop
+            capture_name = "OBS_Capture"
+        else:
+            capture_target = capture_process_loop
+            capture_name = "Legacy_Capture"
+
         process_map = {
-            "Capture": (capture_process_loop, (self.raw_frame_queue, self.config, self.shutdown_event)),
+            capture_name: (capture_target, (self.raw_frame_queue, self.config, self.shutdown_event)),
             "Triage": (dispatcher_loop, (self.raw_frame_queue, self.salience_task_queue, self.shm_notification_queue, self.config, self.shutdown_event)),
         }
         for name, (target, args) in process_map.items():
@@ -832,38 +964,701 @@ class AsyncPersistenceManager:
         print("Persistence manager shut down.")
 
 # =====================================================================================
+#  PAGED ORCHESTRATOR (NEW ARCHITECTURE)
+# =====================================================================================
+
+class PagedOrchestrator:
+    """
+    The Paged Orchestrator: Uses the GlobalScheduler for priority-based page processing.
+
+    Key differences from legacy Orchestrator:
+    1. Pages are small (1.5s instead of 12s chunks)
+    2. Two-phase triage: coarse first, fine only for interesting pages
+    3. Global scheduler prioritizes new page triage over refinement
+    4. Boring pages evicted immediately after baseline encode
+    5. Keyframe stills are ACTUALLY SAVED (via FrameArchiver)
+    6. Baseline encoding uses proper frame decimation
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.is_running = True
+        self.shutdown_event = Event()
+        self.preemption_flag = Event()  # Set when new page arrives during refinement
+
+        # Queues
+        self.raw_frame_queue_max_size = config['capture_fps'] * 3
+        self.raw_frame_queue = Queue(maxsize=self.raw_frame_queue_max_size)
+        self.page_queue = Queue()           # Pages from dispatcher
+        self.baseline_queue = Queue()       # Decimated frames for baseline encoding
+        self.triage_work_queue = Queue()    # Work items for triage worker
+        self.triage_result_queue = Queue()  # Results from triage worker
+        self.encoding_task_queue = Queue()
+        self.encoding_results_queue = Queue()
+
+        # Global scheduler
+        self.scheduler = GlobalScheduler()
+
+        # Components
+        self.persistence_manager = AsyncPersistenceManager(config['output_path'], Queue())
+        self.frame_archiver = hmi_utils.FrameArchiver(config['output_path'])
+        self.video_encoder = hmi_utils.VideoEncoder(config['output_path'])
+        self.guardian_thread = Thread(target=self._guardian_loop, daemon=True)
+        self.baseline_encoder_thread = Thread(target=self._baseline_encoder_loop, daemon=True)
+
+        self.processes = []
+        self.threads = []
+        self.logger = ProgressLogger()
+
+        # Stats
+        self.last_log_time = time.time()
+        self.log_interval_seconds = 2.0
+
+    def start(self):
+        """Start all worker processes and the main orchestration loop."""
+        self._start_workers()
+        self.persistence_manager.start()
+        self.guardian_thread.start()
+        self.baseline_encoder_thread.start()
+
+        print("Starting paged orchestration loop... Press Ctrl+C to stop.")
+        try:
+            while self.is_running:
+                # 1. Receive new pages from dispatcher
+                self._receive_new_pages()
+
+                # 2. Dispatch work to triage worker based on scheduler priority
+                self._dispatch_scheduled_work()
+
+                # 3. Process triage results
+                self._process_triage_results()
+
+                # 4. Check encoding results
+                self._process_encoding_results()
+
+                # 5. Log status
+                self._log_status()
+
+                time.sleep(0.008)  # ~120Hz orchestration loop
+
+        except (KeyboardInterrupt, SystemExit):
+            self.is_running = False
+        finally:
+            self.shutdown()
+
+    def _receive_new_pages(self):
+        """Receive new pages from dispatcher and register with scheduler."""
+        pages_received = 0
+        while not self.page_queue.empty():
+            try:
+                page_task = self.page_queue.get_nowait()
+                page = page_task['page_metadata']
+
+                # CRITICAL: Open SHM handle IMMEDIATELY to keep it alive on Windows!
+                # On Windows, SharedMemory is destroyed when all handles are closed.
+                # The dispatcher closes its handle after putting page on queue, so we
+                # MUST open our handle before that happens.
+                try:
+                    shm_handle = shared_memory.SharedMemory(name=page.shm_name)
+                except FileNotFoundError:
+                    print(f"[Orchestrator] WARNING: SHM {page.shm_name} not found, page may have been lost")
+                    continue
+
+                # Register with scheduler, passing handle to keep SHM alive
+                self.scheduler.register_page(page, shm_handle=shm_handle)
+                pages_received += 1
+
+            except queue.Empty:
+                break
+
+        # Only preempt refinement if we have a BACKLOG of pages waiting for triage
+        # This allows some refinement to complete instead of constant preemption
+        if pages_received > 0 and self.scheduler.current_refinement_page is not None:
+            pending_triage = sum(1 for p in self.scheduler.pages.values()
+                               if p.state == PageState.PENDING_TRIAGE)
+            if pending_triage >= 2:  # Only preempt if 2+ pages waiting
+                self.preemption_flag.set()
+
+    def _dispatch_scheduled_work(self):
+        """Get next work item from scheduler and dispatch to triage worker."""
+        # FIRST: Process ALL pending evictions (they're fast, no worker needed)
+        # This prevents eviction starvation from constant triage/refinement work
+        self._process_pending_evictions()
+
+        # THEN: Get next triage/refinement work
+        work = self.scheduler.get_next_work()
+        if work is None:
+            return
+
+        page = self.scheduler.pages.get(work.page_id)
+        if page is None:
+            return
+
+        if work.work_type == WorkType.COARSE_TRIAGE:
+            task = {
+                'work_type': 'COARSE_TRIAGE',
+                'page_id': page.page_id,
+                'shm_name': page.shm_name,
+                'shape': page.shape,
+                'dtype': page.dtype,
+                'timestamps': page.timestamps,
+            }
+            self.triage_work_queue.put(task)
+
+        elif work.work_type == WorkType.FINE_REFINEMENT:
+            task = {
+                'work_type': 'FINE_REFINEMENT',
+                'page_id': page.page_id,
+                'shm_name': page.shm_name,
+                'shape': page.shape,
+                'dtype': page.dtype,
+                'timestamps': page.timestamps,
+                'hot_regions': page.hot_regions or [],
+            }
+            self.triage_work_queue.put(task)
+
+        elif work.work_type == WorkType.EVICTION:
+            # Shouldn't get here often now, but handle just in case
+            self._evict_page(work.page_id)
+
+    def _process_pending_evictions(self):
+        """Process all pages in BORING_EVICTING state without using the priority queue."""
+        with self.scheduler.lock:
+            pages_to_evict = [
+                page_id for page_id, page in self.scheduler.pages.items()
+                if page.state == PageState.BORING_EVICTING
+            ]
+
+        for page_id in pages_to_evict:
+            self._evict_page(page_id)
+
+    def _evict_page(self, page_id: str):
+        """Evict a single page and clean up its SHM."""
+        shm = self.scheduler.evict_page(page_id)
+        if shm:
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:
+                pass
+
+    def _process_triage_results(self):
+        """Process results from triage worker."""
+        while not self.triage_result_queue.empty():
+            try:
+                result = self.triage_result_queue.get_nowait()
+                work_type = result.get('work_type')
+                page_id = result.get('page_id')
+
+                if work_type == 'COARSE_TRIAGE':
+                    is_interesting = result.get('is_interesting', False)
+                    max_novelty = result.get('max_novelty', 0.0)
+                    hot_regions = result.get('hot_regions', [])
+
+                    if is_interesting:
+                        # Schedule for fine refinement
+                        page = self.scheduler.pages.get(page_id)
+                        if page:
+                            page.hot_regions = hot_regions
+                        self.scheduler.schedule_refinement(page_id, max_novelty)
+                        self.logger.log("triage", f"Page {page_id[:12]} INTERESTING (novelty={max_novelty:.2f})")
+                    else:
+                        # Schedule for eviction (boring page)
+                        self.scheduler.schedule_eviction(page_id)
+                        self.logger.log("triage", f"Page {page_id[:12]} boring, evicting")
+
+                elif work_type == 'FINE_REFINEMENT':
+                    keyframes = result.get('keyframes', [])
+                    was_preempted = result.get('was_preempted', False)
+
+                    if was_preempted:
+                        # Pause and reschedule
+                        self.scheduler.pause_refinement(page_id)
+                        self.preemption_flag.clear()
+                        self.logger.log("preempt", f"Page {page_id[:12]} refinement preempted")
+                    else:
+                        # Refinement complete
+                        self.scheduler.complete_refinement(page_id)
+
+                        if keyframes:
+                            self._handle_keyframes(result, keyframes)
+                        else:
+                            # No keyframes found, just evict
+                            self.scheduler.schedule_eviction(page_id)
+
+            except queue.Empty:
+                break
+
+    def _handle_keyframes(self, result, keyframes):
+        """
+        Handle keyframes from refinement:
+        1. Save stills via FrameArchiver (THE MISSING FUNCTIONALITY!)
+        2. Dispatch high-quality video encoding
+        3. Log events to persistence manager
+        """
+        page_id = result['page_id']
+        shm_name = result['shm_name']
+        shape = result['shape']
+        dtype = result['dtype']
+        timestamps = result['timestamps']
+
+        try:
+            # Open SHM to access frames
+            shm = shared_memory.SharedMemory(name=shm_name)
+            buffer = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+            timestamps_arr = np.array(timestamps)
+
+            # --- SAVE KEYFRAME STILLS (THE MISSING PIECE!) ---
+            for kf in keyframes:
+                frame_idx = kf.get('frame_index')
+                if frame_idx is not None and 0 <= frame_idx < len(buffer):
+                    frame_data = buffer[frame_idx]
+                    event_type = kf.get('type', 'KEYFRAME')
+                    timestamp = kf.get('timestamp', timestamps_arr[frame_idx])
+
+                    # ACTUALLY SAVE THE STILL!
+                    saved_path = self.frame_archiver.save_frame(frame_data, timestamp, event_type)
+
+                    if saved_path:
+                        # Log the keyframe event with the saved path
+                        event = {
+                            "event_id": str(uuid.uuid4()),
+                            "stream_type": event_type,
+                            "start_timestamp": timestamp,
+                            "delta_timestamp": 0.0,
+                            "payload_json": orjson.dumps({
+                                "z_score": kf.get('z_score'),
+                                "score": kf.get('score'),
+                                "reason": kf.get('reason'),
+                                "frame_index": frame_idx,
+                                "still_path": saved_path,
+                            }).decode('utf-8')
+                        }
+                        self.persistence_manager.event_queue.put(event)
+
+            # --- DISPATCH HIGH-QUALITY VIDEO ENCODING ---
+            # Merge keyframe intervals with padding
+            padding = self.config.get('keyframe_padding_seconds', 0.5)
+            intervals = []
+            for kf in keyframes:
+                ts = kf.get('timestamp')
+                if ts is not None:
+                    intervals.append([ts - padding, ts + padding])
+
+            if intervals:
+                intervals.sort(key=lambda x: x[0])
+                merged = [intervals[0]]
+                for interval in intervals[1:]:
+                    if interval[0] <= merged[-1][1]:
+                        merged[-1][1] = max(merged[-1][1], interval[1])
+                    else:
+                        merged.append(interval)
+
+                # Dispatch encoding jobs
+                for start_time, end_time in merged:
+                    mask = (timestamps_arr >= start_time) & (timestamps_arr <= end_time)
+                    indices = np.where(mask)[0]
+                    if len(indices) > 0:
+                        frames_to_encode = buffer[indices].copy()  # Copy before closing SHM
+                        timestamps_to_encode = timestamps_arr[indices]
+                        self.encoding_task_queue.put({
+                            'frames': frames_to_encode,
+                            'timestamps': timestamps_to_encode,
+                            'quality': 'HIGH',
+                        })
+
+            shm.close()
+
+            # Schedule eviction now that we've handled the keyframes
+            self.scheduler.schedule_eviction(page_id)
+
+        except FileNotFoundError:
+            print(f"WARNING: SHM {shm_name} not found for keyframe handling")
+        except Exception as e:
+            print(f"ERROR handling keyframes: {e}")
+            import traceback; traceback.print_exc()
+
+    def _process_encoding_results(self):
+        """Check for completed encoding jobs."""
+        while not self.encoding_results_queue.empty():
+            try:
+                self.encoding_results_queue.get_nowait()
+                # Just count completions for now
+            except queue.Empty:
+                break
+
+    def _baseline_encoder_loop(self):
+        """Background thread that encodes decimated page frames to ONE continuous file."""
+        print("Baseline encoder thread started")
+
+        # Continuous encoder state
+        ffmpeg_proc = None
+        ffmpeg_stdin = None
+        current_dimensions = None
+
+        def start_encoder(dimensions):
+            """Start a new continuous encoder for the given dimensions."""
+            nonlocal ffmpeg_proc, ffmpeg_stdin, current_dimensions
+            proc, stdin, stderr = self.video_encoder.start_continuous_encode(
+                dimensions=dimensions,
+                fps=BASELINE_TARGET_FPS
+            )
+            ffmpeg_proc = proc
+            ffmpeg_stdin = stdin
+            current_dimensions = dimensions
+            return proc, stdin
+
+        def stop_encoder():
+            """Gracefully stop the current encoder."""
+            nonlocal ffmpeg_proc, ffmpeg_stdin, current_dimensions
+            if ffmpeg_stdin:
+                try:
+                    ffmpeg_stdin.close()
+                except Exception:
+                    pass
+            if ffmpeg_proc:
+                try:
+                    ffmpeg_proc.wait(timeout=5.0)
+                except Exception:
+                    ffmpeg_proc.kill()
+            ffmpeg_proc = None
+            ffmpeg_stdin = None
+            current_dimensions = None
+
+        try:
+            while self.is_running or not self.baseline_queue.empty():
+                try:
+                    task = self.baseline_queue.get(timeout=0.5)
+
+                    # Read frames from SHM
+                    shm_name = task['shm_name']
+                    shape = task['shape']
+                    dtype = np.dtype(task['dtype'])
+                    timestamps = task['timestamps']
+
+                    try:
+                        # Extract decimated frames
+                        decimated_frames, decimated_timestamps = get_decimated_frames_for_baseline(
+                            shm_name=shm_name,
+                            shape=shape,
+                            dtype=dtype,
+                            timestamps=timestamps,
+                            target_fps=BASELINE_TARGET_FPS
+                        )
+
+                        if len(decimated_frames) == 0:
+                            continue
+
+                        frame_dimensions = decimated_frames[0].shape
+
+                        # Start or restart encoder if dimensions changed
+                        if ffmpeg_proc is None or frame_dimensions != current_dimensions:
+                            if ffmpeg_proc is not None:
+                                print(f"[Baseline] Dimension change: {current_dimensions} -> {frame_dimensions}")
+                                stop_encoder()
+                            start_encoder(frame_dimensions)
+
+                        # Write frames to the continuous encoder
+                        if ffmpeg_stdin:
+                            try:
+                                frame_bytes = np.ascontiguousarray(decimated_frames).tobytes()
+                                ffmpeg_stdin.write(frame_bytes)
+                            except (BrokenPipeError, OSError):
+                                print("[Baseline] Pipe broke, restarting encoder")
+                                stop_encoder()
+                                start_encoder(frame_dimensions)
+                                # Retry write
+                                try:
+                                    frame_bytes = np.ascontiguousarray(decimated_frames).tobytes()
+                                    ffmpeg_stdin.write(frame_bytes)
+                                except Exception:
+                                    pass
+
+                    except FileNotFoundError:
+                        # SHM was already evicted, skip this page
+                        pass
+
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    print(f"Baseline encoder error: {e}")
+                    import traceback; traceback.print_exc()
+
+        finally:
+            # Clean up encoder on exit
+            stop_encoder()
+            print("Baseline encoder thread finished")
+
+    def _log_status(self):
+        """Log pipeline status periodically."""
+        now = time.time()
+        if (now - self.last_log_time) < self.log_interval_seconds:
+            return
+
+        stats = self.scheduler.get_stats()
+        status_line = (
+            f"[Paged Pipeline] "
+            f"Active: {stats['active_pages']} | "
+            f"Pending: {stats['pending_work']} | "
+            f"Triaged: {stats['pages_triaged']} | "
+            f"Evicted: {stats['pages_evicted_boring']} | "
+            f"Interesting: {stats['pages_retained_interesting']}"
+        )
+        self.logger.log("status", status_line)
+        self.last_log_time = now
+
+    def _guardian_loop(self):
+        """Monitor system resources and take emergency action."""
+        print("Guardian thread started")
+        while self.is_running:
+            mem_percent = psutil.virtual_memory().percent
+
+            if mem_percent > 95.0:
+                print(f"CRITICAL: Memory at {mem_percent}%. Forcing shutdown.")
+                os._exit(1)
+
+            elif mem_percent > 90.0:
+                print(f"WARNING: Memory at {mem_percent}%. Shedding boring pages.")
+                # Evict all pending pages
+                with self.scheduler.lock:
+                    for page_id, page in list(self.scheduler.pages.items()):
+                        if page.state == PageState.PENDING_TRIAGE:
+                            self.scheduler.schedule_eviction(page_id)
+
+            time.sleep(2)
+
+    def _start_workers(self):
+        """Start all worker processes."""
+        # Capture process - use OBS if preferred and available
+        if self.config.get('prefer_obs') and OBS_AVAILABLE:
+            capture_proc = Process(
+                target=obs_capture_process_loop,
+                args=(self.raw_frame_queue, self.config, self.shutdown_event),
+                name="OBS_Capture",
+                daemon=True
+            )
+        else:
+            capture_proc = Process(
+                target=capture_process_loop,
+                args=(self.raw_frame_queue, self.config, self.shutdown_event),
+                name="Legacy_Capture",
+                daemon=True
+            )
+        self.processes.append(capture_proc)
+
+        # Paged dispatcher process
+        dispatcher_proc = Process(
+            target=dispatcher_loop,
+            args=(self.raw_frame_queue, self.page_queue, self.baseline_queue,
+                  self.config, self.shutdown_event),
+            name="PagedDispatcher",
+            daemon=True
+        )
+        self.processes.append(dispatcher_proc)
+
+        # Triage worker (uses two-phase triage)
+        triage_proc = Process(
+            target=sal_wo.paged_triage_worker_loop,
+            args=(self.triage_work_queue, self.triage_result_queue,
+                  self.config, self.config['output_path'],
+                  self.shutdown_event, self.preemption_flag),
+            name="TriageWorker",
+            daemon=True
+        )
+        self.processes.append(triage_proc)
+
+        # Video encoding workers
+        for i in range(2):
+            enc_proc = Process(
+                target=video_encoding_worker_loop,
+                args=(self.encoding_task_queue, self.encoding_results_queue,
+                      self.config['output_path']),
+                name=f"Encoder-{i}",
+                daemon=True
+            )
+            self.processes.append(enc_proc)
+
+        # Start all processes
+        for p in self.processes:
+            p.start()
+
+        # Input capture thread
+        input_thread = Thread(
+            target=hmi_utils.input_capture_worker,
+            args=(self.persistence_manager.event_queue, self.config['window_name']),
+            daemon=True
+        )
+        self.threads.append(input_thread)
+        input_thread.start()
+
+    def shutdown(self):
+        """Graceful shutdown."""
+        print("\nShutting down paged orchestrator...")
+        if not self.is_running:
+            return
+        self.is_running = False
+
+        print("-> Signaling shutdown...")
+        self.shutdown_event.set()
+
+        print("-> Sending shutdown signals...")
+        self.triage_work_queue.put(None)
+        for _ in range(2):
+            self.encoding_task_queue.put(None)
+
+        print("-> Waiting for processes...")
+        for p in self.processes:
+            p.join(timeout=5)
+            if p.is_alive():
+                print(f"WARNING: {p.name} did not terminate, forcing")
+                p.terminate()
+
+        self.video_encoder.shutdown_all()
+        self.persistence_manager.shutdown()
+
+        # Cleanup remaining SHM blocks
+        print("-> Cleaning up pages...")
+        with self.scheduler.lock:
+            for page_id in list(self.scheduler.pages.keys()):
+                shm = self.scheduler.evict_page(page_id)
+                if shm:
+                    try:
+                        shm.close()
+                        shm.unlink()
+                    except Exception:
+                        pass
+
+        self.logger.finalize()
+        print("-> Shutdown complete.")
+
+
+# =====================================================================================
 #  MAIN ENTRY POINT
 # =====================================================================================
 
 if __name__ == "__main__":
-    if RECORDING_WINDOW_NAME is None and CAPTURE_REGION is None:
-        print("ERROR: You must set RECORDING_WINDOW_NAME or CAPTURE_REGION.")
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Salience-driven gameplay capture",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Capture Modes:
+  --obs          Use OBS Virtual Camera (RECOMMENDED - anti-cheat safe)
+  --window NAME  Use legacy window title matching (fragile, breaks on title change)
+  --legacy       Use old 12s chunk architecture instead of 1.5s pages
+
+Examples:
+  python recording_stuff.py --obs                    # OBS Virtual Camera (best)
+  python recording_stuff.py --obs --obs-device 2    # Specific video device
+  python recording_stuff.py --window "Sulfur"       # Legacy window capture
+  python recording_stuff.py --legacy --window "Sulfur"  # Old architecture
+
+Setup OBS first:
+  python obs_setup.py --install      # Install OBS
+  python obs_setup.py --setup-vcam   # Set up Virtual Camera
+        """
+    )
+    parser.add_argument("--legacy", action="store_true",
+                        help="Use legacy chunk-based orchestrator (12s chunks)")
+    parser.add_argument("--window", type=str, default=None,
+                        help="Window name for legacy capture (fragile!)")
+    parser.add_argument("--obs", action="store_true",
+                        help="Use OBS Virtual Camera capture (recommended)")
+    parser.add_argument("--obs-device", type=int, default=None,
+                        help="Video device index for OBS Virtual Camera")
+    parser.add_argument("--no-obs", action="store_true",
+                        help="Force legacy capture even if OBS is available")
+    args = parser.parse_args()
+
+    # Determine capture mode
+    use_obs = False
+    window_name = args.window or RECORDING_WINDOW_NAME
+
+    if args.obs:
+        if not OBS_AVAILABLE:
+            print("ERROR: --obs requested but obs_capture module not available")
+            print("       Install opencv-python: pip install opencv-python")
+            exit(1)
+        use_obs = True
+    elif args.no_obs:
+        use_obs = False
+    elif OBS_AVAILABLE and not args.window:
+        # Default to OBS if available and no window specified
+        use_obs = True
+
+    # Validate we have a capture source
+    if not use_obs and not window_name and not CAPTURE_REGION:
+        print("ERROR: You must specify a capture source:")
+        print("  --obs              Use OBS Virtual Camera")
+        print("  --window NAME      Use legacy window capture")
         exit(1)
 
     os.makedirs(OUTPUT_PATH, exist_ok=True)
-    
+
     config = {
-        "window_name": RECORDING_WINDOW_NAME,
+        "window_name": window_name,
         "region": CAPTURE_REGION,
         "output_path": OUTPUT_PATH,
-        "chunk_seconds": CHUNK_SECONDS,
         "capture_fps": CAPTURE_FPS,
-        "triage_threshold": TRIAGE_THRESHOLD,
-        "keyframe_padding_seconds": KEYFRAME_PADDING_SECONDS, 
-        "salience_kernels": SALIENCE_KERNELS, 
+        "keyframe_padding_seconds": KEYFRAME_PADDING_SECONDS,
+        "salience_kernels": SALIENCE_KERNELS,
         "salience_strategy": SALIENCE_STRATEGY,
         "scheduled_hyperparams": SCHEDULED_HYPERPARAMS,
-        **STRATEGY_CONFIGS[SALIENCE_STRATEGY]
+        **STRATEGY_CONFIGS[SALIENCE_STRATEGY],
+
+        # Paged memory model config
+        "page_seconds": PAGE_SECONDS,
+        "coarse_triage_sentinels": COARSE_TRIAGE_SENTINELS,
+        "coarse_triage_novelty_threshold": COARSE_TRIAGE_NOVELTY_THRESHOLD,
+        "fine_refinement_max_p": FINE_REFINEMENT_MAX_P,
+
+        # Legacy compatibility
+        "chunk_seconds": PAGE_SECONDS if not args.legacy else CHUNK_SECONDS,
+        "triage_threshold": TRIAGE_THRESHOLD,
+
+        # OBS capture config
+        "prefer_obs": use_obs,
+        "require_obs": args.obs,  # If --obs was explicitly passed, require it (no silent fallback)
+        "obs_device_index": args.obs_device,
     }
 
     orchestrator = None
     try:
-        orchestrator = Orchestrator(config)
+        # Print mode info
+        print("=" * 60)
+        if args.legacy:
+            print("  LEGACY MODE: Chunk-based orchestrator (12s chunks)")
+        else:
+            print("  PAGED MODE: Paged orchestrator (1.5s pages)")
+            print("  - Two-phase triage (coarse -> fine)")
+            print("  - Priority scheduling (triage > refinement)")
+            print("  - Keyframe stills saved to ./stills/")
+
+        if use_obs:
+            print("  CAPTURE: OBS Virtual Camera (anti-cheat safe)")
+            if args.obs:
+                print("           (explicitly requested with --obs, NO fallback)")
+            if args.obs_device is not None:
+                print(f"           Device index: {args.obs_device}")
+            print("           Make sure OBS is running with Virtual Camera started!")
+        else:
+            print(f"  CAPTURE: Legacy window matching (fragile!)")
+            print(f"           Window: '{window_name}'")
+        print("=" * 60)
+        print()
+
+        if args.legacy:
+            orchestrator = Orchestrator(config)
+        else:
+            orchestrator = PagedOrchestrator(config)
+
         orchestrator.start()
+
     except WindowNotFoundError as e:
         print(f"FATAL STARTUP ERROR: {e}")
     except Exception as e:
         print(f"An unexpected error occurred in the main block: {e}")
-        # In case of an early crash, we still want to try to shut down
+        import traceback; traceback.print_exc()
         if orchestrator:
             orchestrator.shutdown()

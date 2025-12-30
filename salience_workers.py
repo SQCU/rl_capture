@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.backends.cuda import sdp_kernel, SDPBackend
 import os
 import time  # --- NEW ---
 from tqdm import tqdm # --- NEW ---
@@ -17,6 +18,20 @@ from typing import Callable
 # --- NEW: Import our new tracker classes ---
 from hyperparameter_schedulers import ConfigScheduler
 from salience_trackers import NaiveZScoreTracker, PCAMahanalobisTracker, TRACKER_STRATEGIES
+
+def log_attention_backend_status(worker_pid):
+    """Checks and logs the status of the selected PyTorch attention backend."""
+    if not torch.cuda.is_available():
+        print(f"[{worker_pid}] CUDA not available. Using default CPU attention backend.")
+        return
+
+    # Check which backend was successfully enabled by the sdp_kernel context
+    if torch.backends.cuda.flash_sdp_enabled():
+        print(f"[{worker_pid}] ✅ PyTorch attention backend set to FLASH ATTENTION (Fastest)")
+    elif torch.backends.cuda.mem_efficient_sdp_enabled():
+        print(f"[{worker_pid}] ✅ PyTorch attention backend set to MEMORY-EFFICIENT (xFormers/Native)")
+    else:
+        print(f"[{worker_pid}] ⚠️ PyTorch attention backend fell back to MATH (Eager/Slowest)")
 
 class LazyFrameAccessor:
     """
@@ -459,8 +474,306 @@ class HierarchicalSearchCoordinator:
 # =====================================================================================
 KERNEL_REGISTRY = {"siglip": SigLIPKernel, "ocr": OCRLatentKernel}
 
+
 # =====================================================================================
-#  MAIN WORKER LOOP
+#  TWO-PHASE TRIAGE WORKER (PAGED MEMORY MODEL)
+# =====================================================================================
+
+class CoarseTriageResult:
+    """Result of coarse triage on a page."""
+    def __init__(self, page_id: str, is_interesting: bool, max_novelty_score: float,
+                 sentinel_indices: list, hot_regions: list, latents_for_update: torch.Tensor):
+        self.page_id = page_id
+        self.is_interesting = is_interesting
+        self.max_novelty_score = max_novelty_score
+        self.sentinel_indices = sentinel_indices
+        self.hot_regions = hot_regions  # List of (start_idx, end_idx) tuples
+        self.latents_for_update = latents_for_update
+
+
+class TwoPhaseTriageCoordinator:
+    """
+    Coordinator for two-phase triage:
+    1. COARSE TRIAGE: Few sentinels (6), quick decision: retain or evict
+    2. FINE REFINEMENT: Only for retained pages, preemptible
+
+    Key insight: Optimize for EVICTION LATENCY, not precision.
+    Most pages are boring - decide that fast and free the memory.
+    """
+
+    def __init__(self, kernels: list, config: dict):
+        self.kernels = kernels
+        self.config = config
+        self.coarse_sentinels = config.get('coarse_triage_sentinels', 6)
+        self.coarse_threshold = config.get('coarse_triage_novelty_threshold', 0.3)
+        self.fine_max_p = config.get('fine_refinement_max_p', 0.15)
+
+        # Scheduler for hyperparameter warmup
+        from hyperparameter_schedulers import ConfigScheduler
+        if "scheduled_hyperparams" in self.config:
+            self.scheduler = ConfigScheduler(self.config["scheduled_hyperparams"])
+        else:
+            self.scheduler = None
+
+    @torch.no_grad()
+    def coarse_triage(self, frame_accessor, timestamps: list, kernel) -> CoarseTriageResult:
+        """
+        Fast coarse triage using few sentinel frames.
+
+        Returns:
+            CoarseTriageResult with decision: is_interesting, hot_regions, etc.
+        """
+        num_frames = len(frame_accessor)
+        page_id = frame_accessor.shm.name
+
+        # Sample few sentinel indices (e.g., 6 evenly spaced)
+        sentinel_indices = np.linspace(0, num_frames - 1, self.coarse_sentinels, dtype=int).tolist()
+
+        # Get frames and compute latents
+        images = frame_accessor.get_batch(sentinel_indices)
+        latents = kernel.get_latents_for_images(images)
+
+        # Get novelty scores
+        scores = kernel.tracker.get_novelty_scores(latents)
+        is_novel_mask, z_scores = kernel.tracker.is_novel(scores)
+
+        # Decision: is ANY sentinel novel enough to warrant retention?
+        max_z_score = z_scores.max().item() if len(z_scores) > 0 else 0.0
+        is_interesting = max_z_score > self.coarse_threshold
+
+        # Identify hot regions (pairs of adjacent sentinels where either is novel)
+        hot_regions = []
+        if is_interesting:
+            for i in range(len(sentinel_indices) - 1):
+                if is_novel_mask[i].item() or is_novel_mask[i + 1].item():
+                    hot_regions.append((sentinel_indices[i], sentinel_indices[i + 1]))
+
+        # Latents go to CPU for model update
+        latents_cpu = latents.to('cpu', non_blocking=True)
+
+        return CoarseTriageResult(
+            page_id=page_id,
+            is_interesting=is_interesting,
+            max_novelty_score=max_z_score,
+            sentinel_indices=sentinel_indices,
+            hot_regions=hot_regions,
+            latents_for_update=latents_cpu
+        )
+
+    @torch.no_grad()
+    def fine_refinement(self, frame_accessor, timestamps: list, kernel,
+                        hot_regions: list, check_preemption: callable) -> dict:
+        """
+        Fine refinement of interesting page. PREEMPTIBLE.
+
+        Args:
+            frame_accessor: Access to page frames
+            timestamps: Frame timestamps
+            kernel: Salience kernel to use
+            hot_regions: List of (start_idx, end_idx) from coarse triage
+            check_preemption: Callable that returns True if we should yield
+
+        Returns:
+            Dict with keyframes, was_preempted flag, latents_for_update
+        """
+        num_frames = len(frame_accessor)
+        budget = int(num_frames * self.fine_max_p)
+        frames_processed = 0
+
+        keyframes = []
+        all_latents = []
+        was_preempted = False
+
+        timestamps_arr = np.array(timestamps)
+
+        # Work queue: (start_idx, end_idx, depth)
+        work_queue = deque(hot_regions)
+
+        while work_queue and frames_processed < budget:
+            # Check for preemption (new page needs triage)
+            if check_preemption():
+                was_preempted = True
+                break
+
+            start_idx, end_idx = work_queue.popleft()
+            span_size = end_idx - start_idx
+
+            if span_size < 4:
+                # Span too small, just sample the midpoint
+                mid_idx = (start_idx + end_idx) // 2
+                indices = [mid_idx]
+            else:
+                # Sample 4 sentinels within this span
+                indices = np.linspace(start_idx, end_idx, 4, dtype=int).tolist()
+
+            frames_processed += len(indices)
+
+            images = frame_accessor.get_batch(indices)
+            latents = kernel.get_latents_for_images(images)
+            scores = kernel.tracker.get_novelty_scores(latents)
+            is_novel_mask, z_scores = kernel.tracker.is_novel(scores)
+
+            all_latents.append(latents.to('cpu', non_blocking=True))
+
+            # Record keyframes and queue sub-regions
+            for i, idx in enumerate(indices):
+                if is_novel_mask[i].item():
+                    keyframes.append({
+                        "type": f"{kernel.kernel_name}_KEYFRAME",
+                        "timestamp": timestamps_arr[idx],
+                        "frame_index": idx,
+                        "z_score": z_scores[i].item(),
+                        "score": scores[i].item(),
+                        "reason": "fine_refinement"
+                    })
+
+            # Queue sub-regions around novel points (if budget allows)
+            if span_size > 8:
+                for i in range(len(indices) - 1):
+                    if is_novel_mask[i].item() or is_novel_mask[i + 1].item():
+                        sub_start, sub_end = indices[i], indices[i + 1]
+                        if sub_end - sub_start > 2:
+                            work_queue.append((sub_start, sub_end))
+
+        latents_for_update = torch.cat(all_latents, dim=0) if all_latents else None
+
+        return {
+            "keyframes": keyframes,
+            "was_preempted": was_preempted,
+            "frames_processed": frames_processed,
+            "latents_for_update": latents_for_update
+        }
+
+
+def paged_triage_worker_loop(work_queue, result_queue, config, output_path, shutdown_event, preemption_flag):
+    """
+    Two-phase triage worker for the paged memory model.
+
+    Handles both:
+    1. COARSE_TRIAGE: Quick decision on new pages (6 sentinels)
+    2. FINE_REFINEMENT: Detailed search on interesting pages (preemptible)
+
+    The worker checks preemption_flag periodically during refinement.
+    If a new page arrives for triage, refinement yields.
+    """
+    worker_pid = os.getpid()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config['device'] = device
+
+    # Initialize kernels
+    kernels = [KERNEL_REGISTRY[name](config) for name in config.get("salience_kernels", ["siglip"])]
+    coordinator = TwoPhaseTriageCoordinator(kernels, config)
+    preprocessor = lambda frame: _downscale_image(Image.fromarray(frame))
+
+    print(f"[{worker_pid}] Paged triage worker started with {len(kernels)} kernels")
+
+    with sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+        log_attention_backend_status(worker_pid)
+
+        while True:
+            try:
+                if shutdown_event.is_set():
+                    break
+
+                task = work_queue.get(timeout=0.1)
+                if task is None:
+                    break
+
+                work_type = task.get('work_type', 'COARSE_TRIAGE')
+                page_id = task.get('page_id')
+
+                frame_accessor = LazyFrameAccessor(
+                    shm_name=task['shm_name'],
+                    shape=task['shape'],
+                    dtype=task['dtype'],
+                    preprocess_fn=preprocessor
+                )
+
+                if work_type == 'COARSE_TRIAGE':
+                    # Fast coarse triage
+                    results = []
+                    for kernel in kernels:
+                        result = coordinator.coarse_triage(
+                            frame_accessor, task['timestamps'], kernel
+                        )
+                        results.append(result)
+
+                        # Update kernel's tracker with coarse latents
+                        if result.latents_for_update is not None:
+                            latents_gpu = result.latents_for_update.to(device)
+                            kernel.tracker.update(latents_gpu)
+
+                    # Combine results: interesting if ANY kernel says so
+                    is_interesting = any(r.is_interesting for r in results)
+                    max_novelty = max(r.max_novelty_score for r in results)
+                    hot_regions = []
+                    for r in results:
+                        hot_regions.extend(r.hot_regions)
+
+                    result_message = {
+                        "work_type": "COARSE_TRIAGE",
+                        "page_id": page_id,
+                        "shm_name": task['shm_name'],
+                        "shape": task['shape'],
+                        "dtype": task['dtype'],
+                        "timestamps": task['timestamps'],
+                        "is_interesting": is_interesting,
+                        "max_novelty": max_novelty,
+                        "hot_regions": hot_regions,
+                    }
+                    result_queue.put(result_message)
+
+                elif work_type == 'FINE_REFINEMENT':
+                    # Detailed refinement (preemptible)
+                    def check_preemption():
+                        return preemption_flag.is_set()
+
+                    all_keyframes = []
+                    was_preempted = False
+
+                    for kernel in kernels:
+                        result = coordinator.fine_refinement(
+                            frame_accessor,
+                            task['timestamps'],
+                            kernel,
+                            task.get('hot_regions', []),
+                            check_preemption
+                        )
+
+                        all_keyframes.extend(result['keyframes'])
+                        was_preempted = was_preempted or result['was_preempted']
+
+                        # Update kernel's tracker
+                        if result['latents_for_update'] is not None:
+                            latents_gpu = result['latents_for_update'].to(device)
+                            kernel.tracker.update(latents_gpu)
+
+                        if was_preempted:
+                            break
+
+                    result_message = {
+                        "work_type": "FINE_REFINEMENT",
+                        "page_id": page_id,
+                        "shm_name": task['shm_name'],
+                        "shape": task['shape'],
+                        "dtype": task['dtype'],
+                        "timestamps": task['timestamps'],
+                        "keyframes": all_keyframes,
+                        "was_preempted": was_preempted,
+                    }
+                    result_queue.put(result_message)
+
+                frame_accessor.close()
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[{worker_pid}] ERROR in paged triage worker: {e}")
+                import traceback; traceback.print_exc()
+
+
+# =====================================================================================
+#  LEGACY MAIN WORKER LOOP (for backwards compatibility)
 # =====================================================================================
 def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown_event, progress_queue):
     worker_pid = os.getpid()
@@ -470,37 +783,44 @@ def analysis_worker_loop(task_queue, return_queue, config, output_path, shutdown
     search_coordinator = HierarchicalSearchCoordinator(kernels, config)
     preprocessor = lambda frame: _downscale_image(Image.fromarray(frame))
 
-    while True:
-        try:
-            if shutdown_event.is_set(): break
-            task = task_queue.get(timeout=0.1)
-            if task is None: break
+    # This context manager will globally set the most efficient attention backend
+    # for all operations within this worker process's lifetime.
+    # The priority is Flash > Memory-Efficient > Eager Math.
+    with sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+        # Log the chosen backend for confirmation.
+        log_attention_backend_status(worker_pid)
 
-            frame_accessor = LazyFrameAccessor(
-                shm_name=task['shm_name'], shape=task['shape'],
-                dtype=task['dtype'], preprocess_fn=preprocessor
-            )
-            # --- Pass progress_queue to the coordinator ---
-            result_data = search_coordinator.process_chunk(frame_accessor, task['timestamps'], shutdown_event, progress_queue)
-            return_message = {
-                "shm_name": task['shm_name'], "shape": task['shape'],
-                "dtype": task['dtype'], "timestamps": task['timestamps'],
-                "source": "HierarchicalSearchCoordinator", "data": result_data
-            }
-            #way too big to print lol
-            #print(f"repr:{repr(result_data)}")
-            return_queue.put(return_message)
-            frame_accessor.close()
-        except queue.Empty:
-            continue
-        except Exception as e:
-            print(f"[{worker_pid}] CRITICAL ERROR in worker loop: {e}")
-            import traceback; traceback.print_exc()
-            if 'task' in locals() and task:
-                failure_message = {
-                    "shm_name": task['shm_name'], "shape": task.get('shape'),
-                    "dtype": task.get('dtype'), "timestamps": task.get('timestamps'),
-                    "source": "HierarchicalSearchCoordinator", "data": {"error": str(e)}
+        while True:
+            try:
+                if shutdown_event.is_set(): break
+                task = task_queue.get(timeout=0.1)
+                if task is None: break
+
+                frame_accessor = LazyFrameAccessor(
+                    shm_name=task['shm_name'], shape=task['shape'],
+                    dtype=task['dtype'], preprocess_fn=preprocessor
+                )
+                # --- Pass progress_queue to the coordinator ---
+                result_data = search_coordinator.process_chunk(frame_accessor, task['timestamps'], shutdown_event, progress_queue)
+                return_message = {
+                    "shm_name": task['shm_name'], "shape": task['shape'],
+                    "dtype": task['dtype'], "timestamps": task['timestamps'],
+                    "source": "HierarchicalSearchCoordinator", "data": result_data
                 }
-                return_queue.put(failure_message)
-                if 'shm' in locals() and shm: shm.close()
+                #way too big to print lol
+                #print(f"repr:{repr(result_data)}")
+                return_queue.put(return_message)
+                frame_accessor.close()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"[{worker_pid}] CRITICAL ERROR in worker loop: {e}")
+                import traceback; traceback.print_exc()
+                if 'task' in locals() and task:
+                    failure_message = {
+                        "shm_name": task['shm_name'], "shape": task.get('shape'),
+                        "dtype": task.get('dtype'), "timestamps": task.get('timestamps'),
+                        "source": "HierarchicalSearchCoordinator", "data": {"error": str(e)}
+                    }
+                    return_queue.put(failure_message)
+                    if 'shm' in locals() and shm: shm.close()
