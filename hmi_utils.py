@@ -16,6 +16,321 @@ import orjson
 from PIL import Image # <--- for framearchiver.
 # claude hates the unfocused general purpose keylogger, they RLHFed that fellow to shreds
 
+# =============================================================================
+#  STABLE WINDOW IDENTIFICATION
+# =============================================================================
+
+@dataclass
+class WindowIdentifier:
+    """Stable identifier for a window that survives title changes."""
+    pid: int                          # Process ID (session-stable)
+    exe_path: str                     # Full executable path (program-stable)
+    exe_name: str                     # Just the executable name
+    app_name: str                     # pywinctl's app name
+    title: str                        # Current window title (metadata only, not for matching)
+
+    def matches_exe(self, other: 'WindowIdentifier') -> bool:
+        """Check if this is the same program (survives title changes)."""
+        if other is None:
+            return False
+        return self.exe_path == other.exe_path
+
+    def matches_pid(self, other: 'WindowIdentifier') -> bool:
+        """Check if this is the exact same process instance."""
+        if other is None:
+            return False
+        return self.pid == other.pid
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for event payload."""
+        return {
+            'pid': self.pid,
+            'exe_path': self.exe_path,
+            'exe_name': self.exe_name,
+            'app_name': self.app_name,
+            'title': self.title,
+        }
+
+
+def get_window_identifier(window, debug: bool = False) -> WindowIdentifier | None:
+    """
+    Get stable identifier for a pywinctl window object.
+
+    Uses PID + executable path which survives:
+    - Window title changes (e.g., DOOM WAD level changes)
+    - Window resize/move
+    - Focus changes
+
+    Only changes when:
+    - Process restarts (new PID)
+    - Different executable launched
+    """
+    if window is None:
+        return None
+
+    try:
+        # Get PID - try multiple methods
+        pid = None
+        try:
+            pid = window.getPID()
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] getPID() failed: {e}")
+
+        # Some pywinctl versions use different attribute names
+        if pid is None:
+            try:
+                pid = getattr(window, '_hWnd', None) or getattr(window, 'pid', None)
+            except Exception:
+                pass
+
+        if pid is None:
+            if debug:
+                print(f"[DEBUG] Could not get PID for window")
+            return None
+
+        # Get executable info from psutil
+        exe_path = "unknown"
+        exe_name = "unknown"
+        try:
+            proc = psutil.Process(pid)
+            exe_path = proc.exe()
+            exe_name = proc.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
+            if debug:
+                print(f"[DEBUG] psutil failed for PID {pid}: {e}")
+            # Fall back to using PID as identifier
+            exe_path = f"pid_{pid}"
+            exe_name = f"pid_{pid}"
+
+        # Get app name from pywinctl
+        app_name = exe_name
+        try:
+            app_name = window.getAppName() or exe_name
+        except Exception:
+            pass
+
+        # Get current title (just metadata)
+        title = ""
+        try:
+            title = window.title or ""
+        except Exception:
+            pass
+
+        return WindowIdentifier(
+            pid=pid,
+            exe_path=exe_path,
+            exe_name=exe_name,
+            app_name=app_name,
+            title=title,
+        )
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] get_window_identifier failed: {e}")
+        return None
+
+
+def get_active_window_identifier() -> WindowIdentifier | None:
+    """Get identifier for the currently active/focused window."""
+    try:
+        active = pwc.getActiveWindow()
+        return get_window_identifier(active)
+    except Exception:
+        return None
+
+
+def list_candidate_windows(debug: bool = False) -> list[tuple[any, WindowIdentifier]]:
+    """
+    Get list of visible APPLICATION windows suitable for tracking.
+
+    Filters out child windows (buttons, toolbars, etc.) to only show
+    actual application windows.
+
+    Returns:
+        List of (pywinctl_window, WindowIdentifier) tuples
+    """
+    import sys
+
+    # System processes to filter out
+    SYSTEM_EXES = {
+        'explorer.exe', 'SearchHost.exe', 'ShellExperienceHost.exe',
+        'TextInputHost.exe', 'SystemSettings.exe', 'ApplicationFrameHost.exe',
+        'LockApp.exe', 'StartMenuExperienceHost.exe', 'SearchUI.exe',
+        'Widgets.exe', 'WidgetService.exe',
+    }
+
+    # Child window titles to skip (UI controls, not real windows)
+    SKIP_TITLES = {
+        'MSCTFIME UI', 'Default IME', 'IME', 'MediaContextNotificationWindow',
+        'Dismiss', 'View Update', 'Tree View', 'ShellView', 'Navigation buttons',
+        'Up band toolbar', 'Address band toolbar', 'SearchEditBox', 'Ribbon',
+        'UIRibbonDockTop', 'UIRibbonDockBottom', 'UIRibbonDockLeft', 'UIRibbonDockRight',
+    }
+
+    # Get all unique window titles first (fast)
+    all_titles = pwc.getAllTitles()
+    if debug:
+        print(f"[DEBUG] Found {len(all_titles)} unique window titles", flush=True)
+
+    # Filter to likely application windows
+    app_titles = []
+    for title in all_titles:
+        if not title or len(title) < 2:
+            continue
+        if title in SKIP_TITLES:
+            continue
+        # Skip very short generic titles
+        if title in ('Edit', 'Button', 'Static', 'ComboBox', 'ListBox'):
+            continue
+        app_titles.append(title)
+
+    if debug:
+        print(f"[DEBUG] {len(app_titles)} titles after filtering", flush=True)
+        sys.stdout.flush()
+
+    candidates = []
+    seen_pids = set()  # Dedupe by PID - one entry per process
+
+    for title in app_titles:
+        try:
+            windows = pwc.getWindowsWithTitle(title)
+            if not windows:
+                continue
+
+            # Just take the first window with this title
+            w = windows[0]
+
+            # Check visibility
+            try:
+                visible = w.isVisible if not callable(w.isVisible) else w.isVisible()
+                if visible is False:
+                    continue
+            except:
+                pass  # Include if we can't check
+
+            # Check size - skip tiny windows (likely controls)
+            try:
+                rect = w.size
+                if rect and (rect[0] < 100 or rect[1] < 50):
+                    if debug:
+                        print(f"[DEBUG] '{title[:30]}': too small ({rect}), skipping", flush=True)
+                    continue
+            except:
+                pass
+
+            win_id = get_window_identifier(w)
+            if win_id is None:
+                continue
+
+            # Skip system processes
+            if win_id.exe_name.lower() in {s.lower() for s in SYSTEM_EXES}:
+                continue
+
+            # Dedupe by PID - only show one window per process
+            if win_id.pid in seen_pids:
+                continue
+            seen_pids.add(win_id.pid)
+
+            if debug:
+                print(f"[DEBUG] INCLUDED: [{win_id.exe_name}] {title[:40]}", flush=True)
+
+            candidates.append((w, win_id))
+
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Error processing '{title[:30]}': {e}", flush=True)
+            continue
+
+    if debug:
+        print(f"[DEBUG] Final candidate count: {len(candidates)}", flush=True)
+        sys.stdout.flush()
+
+    return candidates
+
+
+def select_target_window(prompt: str = "Select window to track inputs for:", debug: bool = False) -> WindowIdentifier | None:
+    """
+    Interactive window selector - lists visible windows, user picks one.
+
+    Args:
+        prompt: Header text to display above the window list
+        debug: If True, print debug info about window enumeration
+
+    Returns:
+        WindowIdentifier for selected window, or None if cancelled/invalid
+    """
+    import sys
+
+    candidates = list_candidate_windows(debug=debug)
+
+    # Force output immediately
+    import sys
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    print(f"[DEBUG] list_candidate_windows returned {len(candidates)} candidates", flush=True)
+    sys.stdout.flush()
+
+    if not candidates:
+        print("No suitable windows found", flush=True)
+        return None
+
+    # Print the menu with explicit flushing (fixes tee/pipe issues)
+    print(f"\n{prompt}", flush=True)
+    print("-" * 60, flush=True)
+    sys.stdout.flush()
+
+    for i, (w, win_id) in enumerate(candidates, 1):
+        try:
+            title_preview = w.title[:45] + "..." if len(w.title) > 45 else w.title
+        except:
+            title_preview = "(title error)"
+        print(f"  {i:2}. [{win_id.exe_name:20}] {title_preview}", flush=True)
+        sys.stdout.flush()  # Flush after EVERY line
+
+    print("-" * 60, flush=True)
+    print("   0. Cancel", flush=True)
+    sys.stdout.flush()
+
+    try:
+        choice = input("\nEnter number: ").strip()
+        if not choice or choice == "0":
+            return None
+
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(candidates):
+            print("Invalid selection", flush=True)
+            return None
+
+        selected = candidates[idx][1]
+        print(f"\nSelected: {selected.exe_name} (PID {selected.pid})", flush=True)
+        return selected
+    except ValueError:
+        print("Invalid input", flush=True)
+        return None
+    except KeyboardInterrupt:
+        print("\nCancelled", flush=True)
+        return None
+
+
+def start_input_capture_with_selector(event_queue: Queue) -> tuple[WindowIdentifier | None, Process | None]:
+    """
+    Interactive setup: let user select window, then start input capture.
+
+    Returns:
+        Tuple of (selected WindowIdentifier, input capture Process) or (None, None) if cancelled
+    """
+    target = select_target_window()
+    if target is None:
+        return None, None
+
+    # Start input capture in a separate process
+    proc = Process(target=input_capture_worker, args=(event_queue, target), daemon=True)
+    proc.start()
+
+    return target, proc
+
+
 def _detect_h264_encoder() -> tuple[str, dict]:
     """
     Detect which H.264 encoder is available in ffmpeg.
@@ -65,22 +380,79 @@ def get_h264_encoder() -> tuple[str, dict]:
     return _H264_ENCODER
 
 class FocusTracker:
-    """Tracks which window currently has focus."""
-    def __init__(self, target_window_name: str):
-        self.target_window_name = target_window_name
+    """
+    Tracks which window currently has focus using stable window identifiers.
+
+    Can match by:
+    - Executable path (survives window title changes like DOOM WAD level changes)
+    - Window title substring (legacy mode, for backwards compatibility)
+    """
+    def __init__(self, target: str | WindowIdentifier, match_mode: str = 'auto'):
+        """
+        Args:
+            target: Either a WindowIdentifier, executable path, or window title substring
+            match_mode: 'exe' (match by executable path), 'title' (match by title substring),
+                       or 'auto' (detect based on target type)
+        """
         self.has_focus = False
         self.is_running = True
+        self.current_window: WindowIdentifier | None = None  # Current focused window info
+        self._lock = Lock()
+
+        # Determine matching strategy
+        if isinstance(target, WindowIdentifier):
+            self._target_identifier = target
+            self._target_exe_path = target.exe_path
+            self._target_title = None
+            self._match_mode = 'exe'
+        elif match_mode == 'title' or (match_mode == 'auto' and not (target.endswith('.exe') or '/' in target or '\\' in target)):
+            # Legacy mode: match by title substring
+            self._target_identifier = None
+            self._target_exe_path = None
+            self._target_title = target
+            self._match_mode = 'title'
+        else:
+            # Match by executable path or name
+            self._target_identifier = None
+            self._target_exe_path = target
+            self._target_title = None
+            self._match_mode = 'exe'
+
         self.thread = Thread(target=self._poll_loop, daemon=True)
         self.thread.start()
-    
+
     def _poll_loop(self):
         """Poll the active window every 50ms."""
         while self.is_running:
-            active = pwc.getActiveWindow()
-            if active:
-                self.has_focus = (self.target_window_name in active.title)
+            active_id = get_active_window_identifier()
+
+            with self._lock:
+                self.current_window = active_id
+
+                if active_id is None:
+                    self.has_focus = False
+                elif self._match_mode == 'exe':
+                    # Match by executable path (stable across title changes)
+                    if self._target_identifier:
+                        self.has_focus = active_id.matches_exe(self._target_identifier)
+                    else:
+                        # Match if target is contained in exe_path or exe_name
+                        self.has_focus = (
+                            self._target_exe_path in active_id.exe_path or
+                            self._target_exe_path == active_id.exe_name or
+                            active_id.exe_path.endswith(self._target_exe_path)
+                        )
+                else:
+                    # Legacy title matching
+                    self.has_focus = self._target_title in active_id.title
+
             time.sleep(0.05)  # 20Hz polling rate
-    
+
+    def get_current_window(self) -> WindowIdentifier | None:
+        """Get the current window identifier (thread-safe)."""
+        with self._lock:
+            return self.current_window
+
     def stop(self):
         self.is_running = False
         self.thread.join()
@@ -638,23 +1010,44 @@ class VideoEncoder:
                     except Exception as e:
                         print(f"Error terminating ffmpeg process {proc.pid}: {e}")
 
-def input_capture_worker(event_queue: Queue, window_name: str):
-    """Listens for keyboard and mouse events and puts them on the event queue."""
+def input_capture_worker(event_queue: Queue, target: str | WindowIdentifier, match_mode: str = 'auto'):
+    """
+    Listens for keyboard and mouse events targeting a specific window.
+
+    Args:
+        event_queue: Queue to put captured events on
+        target: Window to track. Can be:
+            - WindowIdentifier: Match by executable path (survives title changes)
+            - String ending in .exe or containing / or \\: Match by executable path
+            - Other string: Match by window title substring (legacy mode)
+        match_mode: Override auto-detection. 'exe', 'title', or 'auto' (default)
+
+    Events include 'window_context' with full WindowIdentifier info (pid, exe_path,
+    exe_name, app_name, title) which remains stable even when window titles change
+    (e.g., DOOM WAD level changes).
+    """
     key_states = {} # Tracks the start time of key presses
-    focus_tracker = FocusTracker(window_name) #revised to take operand windowname
+    focus_tracker = FocusTracker(target, match_mode=match_mode)
     trajectory_tracker = MouseTrajectoryTracker(sample_interval=0.0111)  # 90Hz sampling
     scroll_tracker = ScrollTrajectoryTracker(timeout=0.3)
 
     # Track which mouse buttons are currently held
     buttons_held = set()
 
+    def _get_window_context() -> dict | None:
+        """Get current window context for event enrichment."""
+        win = focus_tracker.get_current_window()
+        return win.to_dict() if win else None
+
     def _emit_mouse_trajectory(traj: MouseTrajectory, queue: Queue):
         """Helper to convert trajectory to event and emit."""
+        window_ctx = _get_window_context()
         event = {
             "event_id": str(uuid.uuid4()),
             "stream_type": "USER_INPUT",
             "start_timestamp": traj.start_time,
             "delta_timestamp": traj.end_time - traj.start_time,
+            "window_context": window_ctx,
             "payload_json": orjson.dumps({
                 "type": "mouse_trajectory",
                 "start_pos": traj.start_pos,
@@ -669,11 +1062,13 @@ def input_capture_worker(event_queue: Queue, window_name: str):
 
     def _emit_scroll_trajectory(traj: ScrollTrajectory, queue: Queue):
         """Helper to convert scroll trajectory to event and emit."""
+        window_ctx = _get_window_context()
         event = {
             "event_id": str(uuid.uuid4()),
             "stream_type": "USER_INPUT",
             "start_timestamp": traj.start_time,
             "delta_timestamp": traj.duration,
+            "window_context": window_ctx,
             "payload_json": orjson.dumps({
                 "type": "scroll_trajectory",
                 "total_dx": traj.total_dx,
@@ -696,11 +1091,13 @@ def input_capture_worker(event_queue: Queue, window_name: str):
         if key_id in key_states:
             start_time = key_states.pop(key_id)
             end_time = time.time()
+            window_ctx = _get_window_context()
             event = {
                 "event_id": str(uuid.uuid4()),
                 "stream_type": "USER_INPUT",
                 "start_timestamp": start_time,
                 "delta_timestamp": end_time - start_time,
+                "window_context": window_ctx,
                 "payload_json": orjson.dumps({"type": "key", "key": key_id}).decode('utf-8')
             }
             event_queue.put(event)
@@ -711,11 +1108,13 @@ def input_capture_worker(event_queue: Queue, window_name: str):
         button_str = str(button)
         if pressed:
             buttons_held.add(button_str)
+            window_ctx = _get_window_context()
             event = {
                 "event_id": str(uuid.uuid4()),
                 "stream_type": "USER_INPUT",
                 "start_timestamp": time.time(),
                 "delta_timestamp": 0.0,
+                "window_context": window_ctx,
                 "payload_json": orjson.dumps({
                     "type": "mouse_click",
                     "button": button_str,
@@ -725,7 +1124,6 @@ def input_capture_worker(event_queue: Queue, window_name: str):
             }
             event_queue.put(event)
         else: # This handles the button release
-            # --- FIX #3: Remove the button from the set when it's released ---
             # Using .discard() is safer than .remove() as it won't error if the key is missing.
             buttons_held.discard(button_str)
 

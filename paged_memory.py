@@ -27,8 +27,8 @@ from threading import Lock
 #  CONFIGURATION: Paged Memory Model
 # =============================================================================
 
-PAGE_SECONDS = 1.5  # Small pages for fast eviction decisions (was 12s chunks)
-PAGE_FRAMES_AT_60FPS = int(PAGE_SECONDS * 60)  # 90 frames per page
+PAGE_SECONDS = 8.0  # Match ML processing throughput (~8-10s per triage cycle)
+PAGE_FRAMES_AT_60FPS = int(PAGE_SECONDS * 60)  # 480 frames per page at 60fps
 
 # Coarse triage uses very few sentinels to decide retain/evict
 COARSE_TRIAGE_SENTINELS = 6  # ~6 forwards per page for initial decision
@@ -200,9 +200,29 @@ class GlobalScheduler:
             heapq.heappush(self.work_queue, work)
             self.pages_evicted_boring += 1
 
-    def get_next_work(self) -> Optional[WorkItem]:
-        """Get the highest priority work item."""
+    def get_next_work(self, prefer_refinement: bool = False) -> Optional[WorkItem]:
+        """Get the highest priority work item.
+
+        Args:
+            prefer_refinement: If True, skip triage work and return refinement work first.
+                              This prevents refinement starvation when pages pile up.
+        """
         with self.lock:
+            # If preferring refinement, first scan for refinement work
+            if prefer_refinement:
+                for i, work in enumerate(self.work_queue):
+                    if work.work_type == WorkType.FINE_REFINEMENT:
+                        if work.page_id in self.pages:
+                            page = self.pages[work.page_id]
+                            if page.state == PageState.INTERESTING_RETAINED:
+                                # Remove from queue and return
+                                self.work_queue.pop(i)
+                                heapq.heapify(self.work_queue)
+                                page.state = PageState.REFINING
+                                self.current_refinement_page = work.page_id
+                                return work
+
+            # Normal priority-based dispatch
             while self.work_queue:
                 work = heapq.heappop(self.work_queue)
 

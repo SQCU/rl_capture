@@ -810,10 +810,20 @@ class Orchestrator:
         for p in self.processes:
             p.start()
 
-        print("-> Starting background threads (Input Capture)...")
-        input_thread = Thread(target=hmi_utils.input_capture_worker, args=(self.persistence_manager.event_queue, self.config['window_name']), daemon=True)
-        self.threads.append(input_thread)
-        input_thread.start()
+        # Input capture thread (only if input_target is set)
+        input_target = self.config.get('input_target')
+        if input_target is not None:
+            print("-> Starting background threads (Input Capture)...")
+            input_thread = Thread(
+                target=hmi_utils.input_capture_worker,
+                args=(self.persistence_manager.event_queue, input_target),
+                daemon=True
+            )
+            self.threads.append(input_thread)
+            input_thread.start()
+            print(f"-> Input capture started for: {input_target if isinstance(input_target, str) else input_target.exe_name}")
+        else:
+            print("-> Input capture DISABLED (no target selected)")
 
     def _guardian_loop(self):
         """Monitors system resources and takes emergency action."""
@@ -1071,13 +1081,11 @@ class PagedOrchestrator:
             except queue.Empty:
                 break
 
-        # Only preempt refinement if we have a BACKLOG of pages waiting for triage
-        # This allows some refinement to complete instead of constant preemption
-        if pages_received > 0 and self.scheduler.current_refinement_page is not None:
-            pending_triage = sum(1 for p in self.scheduler.pages.values()
-                               if p.state == PageState.PENDING_TRIAGE)
-            if pending_triage >= 2:  # Only preempt if 2+ pages waiting
-                self.preemption_flag.set()
+        # DISABLED: Preemption causes more problems than it solves with single worker
+        # The worker can only do one thing at a time anyway, so preemption just
+        # causes thrashing. Let refinement complete, then triage will run.
+        # TODO: Re-enable with smarter logic once basic flow works
+        pass
 
     def _dispatch_scheduled_work(self):
         """Get next work item from scheduler and dispatch to triage worker."""
@@ -1085,8 +1093,24 @@ class PagedOrchestrator:
         # This prevents eviction starvation from constant triage/refinement work
         self._process_pending_evictions()
 
-        # THEN: Get next triage/refinement work
-        work = self.scheduler.get_next_work()
+        # Only allow ONE page in TRIAGING or REFINING at a time (single worker)
+        # But prioritize refinement if interesting pages are piling up
+        with self.scheduler.lock:
+            states = [p.state for p in self.scheduler.pages.values()]
+            triaging_count = sum(1 for s in states if s == PageState.TRIAGING)
+            refining_count = sum(1 for s in states if s == PageState.REFINING)
+            interesting_waiting = sum(1 for s in states if s == PageState.INTERESTING_RETAINED)
+
+        # Skip if worker is already busy
+        if triaging_count >= 1 or refining_count >= 1:
+            return
+
+        # If interesting pages are piling up, force refinement by skipping triage
+        # This prevents refinement starvation from constant new page arrivals
+        force_refinement = interesting_waiting >= 3
+
+        # THEN: Get next work (possibly forcing refinement)
+        work = self.scheduler.get_next_work(prefer_refinement=force_refinement)
         if work is None:
             return
 
@@ -1396,13 +1420,27 @@ class PagedOrchestrator:
             return
 
         stats = self.scheduler.get_stats()
+        state_dist = stats.get('state_distribution', {})
+        # Compact state names
+        state_abbrev = {
+            'PENDING_TRIAGE': 'PendT',
+            'TRIAGING': 'Triage',
+            'BORING_EVICTING': 'BorEvict',
+            'INTERESTING_RETAINED': 'IntRet',
+            'REFINING': 'Refine',
+            'ENCODING_INTERESTING': 'EncInt',
+            'EVICTED': 'Evict',
+        }
+        state_str = " ".join(f"{state_abbrev.get(k, k)}:{v}" for k, v in state_dist.items() if v > 0)
+
         status_line = (
             f"[Paged Pipeline] "
             f"Active: {stats['active_pages']} | "
             f"Pending: {stats['pending_work']} | "
             f"Triaged: {stats['pages_triaged']} | "
             f"Evicted: {stats['pages_evicted_boring']} | "
-            f"Interesting: {stats['pages_retained_interesting']}"
+            f"Interesting: {stats['pages_retained_interesting']} | "
+            f"States: {state_str}"
         )
         self.logger.log("status", status_line)
         self.last_log_time = now
@@ -1482,14 +1520,19 @@ class PagedOrchestrator:
         for p in self.processes:
             p.start()
 
-        # Input capture thread
-        input_thread = Thread(
-            target=hmi_utils.input_capture_worker,
-            args=(self.persistence_manager.event_queue, self.config['window_name']),
-            daemon=True
-        )
-        self.threads.append(input_thread)
-        input_thread.start()
+        # Input capture thread (only if input_target is set)
+        input_target = self.config.get('input_target')
+        if input_target is not None:
+            input_thread = Thread(
+                target=hmi_utils.input_capture_worker,
+                args=(self.persistence_manager.event_queue, input_target),
+                daemon=True
+            )
+            self.threads.append(input_thread)
+            input_thread.start()
+            print(f"-> Input capture started for: {input_target if isinstance(input_target, str) else input_target.exe_name}")
+        else:
+            print("-> Input capture DISABLED (no target selected)")
 
     def shutdown(self):
         """Graceful shutdown."""
@@ -1548,11 +1591,15 @@ Capture Modes:
   --window NAME  Use legacy window title matching (fragile, breaks on title change)
   --legacy       Use old 12s chunk architecture instead of 1.5s pages
 
+Input Capture:
+  --no-input     Disable keyboard/mouse input capture
+  --input-exe    Executable name/path to track (skips selector)
+
 Examples:
-  python recording_stuff.py --obs                    # OBS Virtual Camera (best)
-  python recording_stuff.py --obs --obs-device 2    # Specific video device
-  python recording_stuff.py --window "Sulfur"       # Legacy window capture
-  python recording_stuff.py --legacy --window "Sulfur"  # Old architecture
+  python recording_stuff.py --obs                    # OBS + window selector
+  python recording_stuff.py --obs --input-exe gzdoom.exe  # Skip selector
+  python recording_stuff.py --obs --no-input         # Video only, no inputs
+  python recording_stuff.py --window "Sulfur"        # Legacy window capture
 
 Setup OBS first:
   python obs_setup.py --install      # Install OBS
@@ -1569,7 +1616,40 @@ Setup OBS first:
                         help="Video device index for OBS Virtual Camera")
     parser.add_argument("--no-obs", action="store_true",
                         help="Force legacy capture even if OBS is available")
+    parser.add_argument("--no-input", action="store_true",
+                        help="Disable keyboard/mouse input capture")
+    parser.add_argument("--input-exe", type=str, default=None,
+                        help="Executable name/path for input capture (skips selector)")
+    parser.add_argument("--debug-windows", action="store_true",
+                        help="Debug window enumeration for input selector")
+    parser.add_argument("--log", type=str, default=None, metavar="FILE",
+                        help="Write all output to log file (keeps terminal interactive)")
     args = parser.parse_args()
+
+    # Set up logging to file if requested
+    if args.log:
+        import sys
+
+        class TeeWriter:
+            """Write to both terminal and log file."""
+            def __init__(self, terminal, logfile):
+                self.terminal = terminal
+                self.logfile = logfile
+
+            def write(self, message):
+                self.terminal.write(message)
+                self.terminal.flush()
+                self.logfile.write(message)
+                self.logfile.flush()
+
+            def flush(self):
+                self.terminal.flush()
+                self.logfile.flush()
+
+        log_file = open(args.log, 'w', encoding='utf-8')
+        sys.stdout = TeeWriter(sys.__stdout__, log_file)
+        sys.stderr = TeeWriter(sys.__stderr__, log_file)
+        print(f"Logging to: {args.log}")
 
     # Determine capture mode
     use_obs = False
@@ -1596,6 +1676,32 @@ Setup OBS first:
 
     os.makedirs(OUTPUT_PATH, exist_ok=True)
 
+    # --- INPUT CAPTURE TARGET SELECTION ---
+    input_target = None  # WindowIdentifier or string for input capture
+    if args.no_input:
+        print("\nInput capture disabled (--no-input)")
+        input_target = None
+    elif args.input_exe:
+        # User specified executable directly, skip selector
+        input_target = args.input_exe
+        print(f"\nInput capture target: {input_target}")
+    else:
+        # Interactive window selector
+        print("\n" + "=" * 60)
+        print("  INPUT CAPTURE SETUP")
+        print("  Select which window to track keyboard/mouse inputs for.")
+        print("  (This is separate from OBS video capture)")
+        print("=" * 60)
+
+        input_target = hmi_utils.select_target_window(debug=args.debug_windows)
+        if input_target is None:
+            print("\nNo window selected. Input capture will be DISABLED.")
+            print("(You can still capture video, just no keyboard/mouse events)")
+            response = input("Continue without input capture? [Y/n]: ").strip().lower()
+            if response == 'n':
+                print("Aborted.")
+                exit(0)
+
     config = {
         "window_name": window_name,
         "region": CAPTURE_REGION,
@@ -1621,6 +1727,9 @@ Setup OBS first:
         "prefer_obs": use_obs,
         "require_obs": args.obs,  # If --obs was explicitly passed, require it (no silent fallback)
         "obs_device_index": args.obs_device,
+
+        # Input capture config (WindowIdentifier, string, or None to disable)
+        "input_target": input_target,
     }
 
     orchestrator = None
@@ -1636,15 +1745,23 @@ Setup OBS first:
             print("  - Keyframe stills saved to ./stills/")
 
         if use_obs:
-            print("  CAPTURE: OBS Virtual Camera (anti-cheat safe)")
+            print("  VIDEO: OBS Virtual Camera (anti-cheat safe)")
             if args.obs:
-                print("           (explicitly requested with --obs, NO fallback)")
+                print("         (explicitly requested with --obs, NO fallback)")
             if args.obs_device is not None:
-                print(f"           Device index: {args.obs_device}")
-            print("           Make sure OBS is running with Virtual Camera started!")
+                print(f"         Device index: {args.obs_device}")
+            print("         Make sure OBS is running with Virtual Camera started!")
         else:
-            print(f"  CAPTURE: Legacy window matching (fragile!)")
-            print(f"           Window: '{window_name}'")
+            print(f"  VIDEO: Legacy window matching (fragile!)")
+            print(f"         Window: '{window_name}'")
+
+        if input_target is None:
+            print("  INPUT: DISABLED (no keyboard/mouse capture)")
+        elif isinstance(input_target, hmi_utils.WindowIdentifier):
+            print(f"  INPUT: {input_target.exe_name} (PID {input_target.pid})")
+            print(f"         Stable ID - survives window title changes")
+        else:
+            print(f"  INPUT: {input_target}")
         print("=" * 60)
         print()
 
