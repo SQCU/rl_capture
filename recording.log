@@ -1,0 +1,202 @@
+Logging to: recording.log (with exception capture)
+
+============================================================
+  INPUT CAPTURE SETUP
+  Select which window to track keyboard/mouse inputs for.
+  (This is separate from OBS video capture)
+============================================================
+[DEBUG] list_candidate_windows returned 23 candidates
+
+Select window to track inputs for:
+------------------------------------------------------------
+   1. [firefox.exe         ] Evolve — Mozilla Firefox
+   2. [VSCodium.exe        ] compare_stats.py - dialogue_yoinker - VSCodiu...
+   3. [chrome.exe          ] Home / X - Google Chrome
+   4. [Taskmgr.exe         ] Task Manager
+   5. [FalloutNV.exe       ] Fallout: New Vegas
+   6. [obs64.exe           ] OBS 32.0.1 - Profile: Untitled - Scenes: Unti...
+   7. [steamwebhelper.exe  ] Steam
+   8. [mmc.exe             ] Event Viewer
+   9. [Telegram.exe        ] ‎Came san – (137)
+  10. [sublime_text.exe    ] capture_run_1767077488 • - Sublime Text (UNRE...
+  11. [Discord.exe         ] @k… - Discord
+  12. [7zFM.exe            ] \\wsl.localhost\Ubuntu-22.04\home\bigboi\hell...
+  13. [powershell.exe      ] ✳ Missing Numbering References
+  14. [WizTree64.exe       ] Help us make WizTree better!
+  15. [notepad.exe         ] hface.txt - Notepad
+  16. [cmd.exe             ] Administrator: Command Prompt
+  17. [cmd.exe             ] Command Prompt
+  18. [cmd.exe             ] Select Administrator: Command Prompt
+  19. [powershell.exe      ] Administrator: Windows PowerShell
+  20. [notepad.exe         ] *ytdlp-mp3.bat - Notepad
+  21. [qbittorrent.exe     ] qBittorrent Update Available
+  22. [notepad.exe         ] eval_outputs.txt - Notepad
+  23. [CalculatorApp.exe   ] Calculator
+------------------------------------------------------------
+   0. Cancel
+
+Enter number: 
+No window selected. Input capture will be DISABLED.
+(You can still capture video, just no keyboard/mouse events)
+Continue without input capture? [Y/n]: ============================================================
+  PAGED MODE: Paged orchestrator (1.5s pages)
+  - Two-phase triage (coarse -> fine)
+  - Priority scheduling (triage > refinement)
+  - Keyframe stills saved to ./stills/
+  VIDEO: OBS Virtual Camera (anti-cheat safe)
+         (explicitly requested with --obs, NO fallback)
+         Make sure OBS is running with Virtual Camera started!
+  INPUT: DISABLED (no keyboard/mouse capture)
+============================================================
+
+Persistence manager initialized. Journaling to ./capture_run_1767083901\events_stream.jsonl
+Frame archiver will save stills to: ./capture_run_1767083901\stills
+-> Input capture DISABLED (no target selected)
+Guardian thread started
+Baseline encoder thread startedStarting paged orchestration loop... Press Ctrl+C to stop.
+
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States:  (x4)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States:  (x5)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States:  (x6)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States:  (x7)[VideoEncoder] Using H.264 encoder: h264_nvenc
+Starting continuous baseline recording to ./capture_run_1767083901\videos\baseline_record_1767083986.mp4 at 640:480 @ 30fps...
+[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States: Triage:1 (x8)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States: Triage:1 (x9)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States: Triage:1 (x10)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 0 | EncQ: 0 | States: Triage:1 (x11)
+Page page_c882e79 boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 1 | Pending: 1 | Triaged: 0 | Evicted: 1 | EncQ: 0 | States: Triage:1 (x1)
+Page page_0f373a6 boring, evicting (x1)                                                            
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 2 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 2 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 2 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 2 | EncQ: 0 | States: Triage:1 (x4)
+Page page_44098f3 boring, evicting (x1)                                                            
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States: Triage:1 (x4)
+Page page_7b8a25d INTERESTING (novelty=2.22) (x1)                                                  
+[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States: Refine:1 (x1)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States: Refine:1 (x2)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States: Refine:1 (x3)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States: Refine:1 PendT:1 (x4)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States: Refine:1 PendT:1 (x5)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States: Refine:1 PendT:1 (x6)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States: Refine:1 PendT:1 (x7)[Paged Pipeline] Active: 3 | Pending: 2 | Triaged: 0 | Evicted: 3 | EncQ: 0 | States: Refine:1 PendT:2 (x8)[Paged Pipeline] Active: 3 | Pending: 3 | Triaged: 0 | Evicted: 4 | EncQ: 1 | States: BorEvict:1 PendT:2 (x9)[Paged Pipeline] Active: 2 | Pending: 2 | Triaged: 0 | Evicted: 4 | EncQ: 0 | States: Triage:1 PendT:1 (x10) 
+Page page_33adaa7 INTERESTING (novelty=3.58) (x1)                                                           Page page_03fec0d INTERESTING (novelty=2.69) (x2)
+[Paged Pipeline] Active: 2 | Pending: 2 | Triaged: 0 | Evicted: 4 | EncQ: 0 | States: Refine:1 IntRet:1 (x1)[Paged Pipeline] Active: 3 | Pending: 3 | Triaged: 0 | Evicted: 4 | EncQ: 0 | States: Refine:1 IntRet:1 PendT:1 (x2)[Paged Pipeline] Active: 3 | Pending: 3 | Triaged: 0 | Evicted: 4 | EncQ: 0 | States: Refine:1 IntRet:1 PendT:1 (x3)[Paged Pipeline] Active: 3 | Pending: 3 | Triaged: 0 | Evicted: 4 | EncQ: 0 | States: Refine:1 IntRet:1 PendT:1 (x4)[Paged Pipeline] Active: 3 | Pending: 3 | Triaged: 0 | Evicted: 4 | EncQ: 0 | States: Refine:1 IntRet:1 PendT:1 (x5)[Paged Pipeline] Active: 4 | Pending: 4 | Triaged: 0 | Evicted: 4 | EncQ: 0 | States: Refine:1 IntRet:1 PendT:2 (x6)[Paged Pipeline] Active: 4 | Pending: 4 | Triaged: 0 | Evicted: 4 | EncQ: 0 | States: Refine:1 IntRet:1 PendT:2 (x7)[Paged Pipeline] Active: 4 | Pending: 4 | Triaged: 0 | Evicted: 4 | EncQ: 0 | States: Refine:1 IntRet:1 PendT:2 (x8)[Paged Pipeline] Active: 4 | Pending: 5 | Triaged: 0 | Evicted: 5 | EncQ: 1 | States: BorEvict:1 IntRet:1 PendT:2 (x9)[Paged Pipeline] Active: 4 | Pending: 5 | Triaged: 0 | Evicted: 5 | EncQ: 0 | States: IntRet:1 Triage:1 PendT:2 (x10) 
+Page page_4ac0a36 INTERESTING (novelty=2.86) (x1)                                                                    
+[Paged Pipeline] Active: 4 | Pending: 5 | Triaged: 0 | Evicted: 5 | EncQ: 0 | States: IntRet:2 PendT:1 Triage:1 (x1)
+Page page_7ff3483 INTERESTING (novelty=2.52) (x1)                                                                   
+[Paged Pipeline] Active: 4 | Pending: 5 | Triaged: 0 | Evicted: 5 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:1 (x1)[Paged Pipeline] Active: 5 | Pending: 6 | Triaged: 0 | Evicted: 5 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x2)[Paged Pipeline] Active: 5 | Pending: 6 | Triaged: 0 | Evicted: 5 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x3)[Paged Pipeline] Active: 5 | Pending: 6 | Triaged: 0 | Evicted: 5 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x4)[Paged Pipeline] Active: 5 | Pending: 6 | Triaged: 0 | Evicted: 5 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x5)[Paged Pipeline] Active: 6 | Pending: 7 | Triaged: 0 | Evicted: 5 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x6)[Paged Pipeline] Active: 6 | Pending: 7 | Triaged: 0 | Evicted: 5 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x7)[Paged Pipeline] Active: 6 | Pending: 8 | Triaged: 0 | Evicted: 6 | EncQ: 1 | States: IntRet:2 BorEvict:1 PendT:3 (x8)
+Page page_25f8c39 INTERESTING (novelty=2.86) (x1)                                                                     
+[Paged Pipeline] Active: 5 | Pending: 7 | Triaged: 0 | Evicted: 6 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x1)[Paged Pipeline] Active: 6 | Pending: 8 | Triaged: 0 | Evicted: 6 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x2)[Paged Pipeline] Active: 6 | Pending: 8 | Triaged: 0 | Evicted: 6 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x3)[Paged Pipeline] Active: 6 | Pending: 8 | Triaged: 0 | Evicted: 6 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x4)[Paged Pipeline] Active: 6 | Pending: 8 | Triaged: 0 | Evicted: 6 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x5)[Paged Pipeline] Active: 6 | Pending: 8 | Triaged: 0 | Evicted: 6 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x6)[Paged Pipeline] Active: 7 | Pending: 9 | Triaged: 0 | Evicted: 6 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:4 (x7)[Paged Pipeline] Active: 7 | Pending: 9 | Triaged: 0 | Evicted: 6 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:4 (x8)[Paged Pipeline] Active: 7 | Pending: 10 | Triaged: 0 | Evicted: 7 | EncQ: 1 | States: IntRet:2 BorEvict:1 PendT:4 (x9)
+Page page_b2fdf72 INTERESTING (novelty=3.17) (x1)                                                                      
+[Paged Pipeline] Active: 6 | Pending: 10 | Triaged: 0 | Evicted: 7 | EncQ: 0 | States: IntRet:3 PendT:3 (x1)[Paged Pipeline] Active: 7 | Pending: 10 | Triaged: 0 | Evicted: 7 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:4 (x2)[Paged Pipeline] Active: 7 | Pending: 10 | Triaged: 0 | Evicted: 7 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:4 (x3)
+Page page_5e74e45 INTERESTING (novelty=2.97) (x1)                                                                    
+[Paged Pipeline] Active: 6 | Pending: 10 | Triaged: 0 | Evicted: 8 | EncQ: 0 | States: Refine:1 PendT:3 IntRet:2 (x1)[Paged Pipeline] Active: 6 | Pending: 10 | Triaged: 0 | Evicted: 8 | EncQ: 0 | States: Refine:1 PendT:3 IntRet:2 (x2)[Paged Pipeline] Active: 7 | Pending: 11 | Triaged: 0 | Evicted: 8 | EncQ: 0 | States: Refine:1 PendT:4 IntRet:2 (x3)
+Page page_eb7b665 INTERESTING (novelty=2.80) (x1)                                                                    
+[Paged Pipeline] Active: 6 | Pending: 11 | Triaged: 0 | Evicted: 9 | EncQ: 0 | States: PendT:3 Refine:1 IntRet:2 (x1)[Paged Pipeline] Active: 6 | Pending: 11 | Triaged: 0 | Evicted: 9 | EncQ: 0 | States: PendT:3 Refine:1 IntRet:2 (x2)[Paged Pipeline] Active: 6 | Pending: 11 | Triaged: 0 | Evicted: 9 | EncQ: 0 | States: PendT:3 Refine:1 IntRet:2 (x3)
+Page page_d175b8e INTERESTING (novelty=2.69) (x1)                                                                    
+[Paged Pipeline] Active: 6 | Pending: 12 | Triaged: 0 | Evicted: 10 | EncQ: 0 | States: IntRet:2 PendT:3 Refine:1 (x1)[Paged Pipeline] Active: 6 | Pending: 12 | Triaged: 0 | Evicted: 10 | EncQ: 0 | States: IntRet:2 PendT:3 Refine:1 (x2)[Paged Pipeline] Active: 6 | Pending: 12 | Triaged: 0 | Evicted: 10 | EncQ: 0 | States: IntRet:2 PendT:3 Refine:1 (x3)
+Page page_a71bfb5 INTERESTING (novelty=2.56) (x1)                                                                     
+[Paged Pipeline] Active: 5 | Pending: 12 | Triaged: 0 | Evicted: 11 | EncQ: 0 | States: IntRet:2 PendT:2 Refine:1 (x1)[Paged Pipeline] Active: 6 | Pending: 13 | Triaged: 0 | Evicted: 11 | EncQ: 0 | States: IntRet:2 PendT:3 Refine:1 (x2)[Paged Pipeline] Active: 6 | Pending: 14 | Triaged: 0 | Evicted: 12 | EncQ: 0 | States: IntRet:2 PendT:3 BorEvict:1 (x3)
+Page page_81e37dd INTERESTING (novelty=2.47) (x1)                                                                       
+[Paged Pipeline] Active: 5 | Pending: 13 | Triaged: 0 | Evicted: 12 | EncQ: 0 | States: IntRet:2 PendT:2 Refine:1 (x1)[Paged Pipeline] Active: 5 | Pending: 13 | Triaged: 0 | Evicted: 12 | EncQ: 0 | States: IntRet:2 PendT:2 Refine:1 (x2)[Paged Pipeline] Active: 5 | Pending: 14 | Triaged: 0 | Evicted: 13 | EncQ: 0 | States: IntRet:2 Triage:1 PendT:2 (x3)
+Page page_c8c9cc8 INTERESTING (novelty=2.41) (x1)                                                                     
+[Paged Pipeline] Active: 5 | Pending: 14 | Triaged: 0 | Evicted: 13 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x1)[Paged Pipeline] Active: 5 | Pending: 14 | Triaged: 0 | Evicted: 13 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x2)[Paged Pipeline] Active: 4 | Pending: 14 | Triaged: 0 | Evicted: 14 | EncQ: 0 | States: IntRet:2 Triage:1 PendT:1 (x3)
+Page page_92a2c31 INTERESTING (novelty=2.34) (x1)                                                                     
+[Paged Pipeline] Active: 5 | Pending: 15 | Triaged: 0 | Evicted: 14 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x1)[Paged Pipeline] Active: 5 | Pending: 15 | Triaged: 0 | Evicted: 14 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x2)[Paged Pipeline] Active: 4 | Pending: 15 | Triaged: 0 | Evicted: 15 | EncQ: 0 | States: IntRet:2 PendT:1 Triage:1 (x3)
+Page page_b161adc INTERESTING (novelty=2.31) (x1)                                                                     
+[Paged Pipeline] Active: 4 | Pending: 15 | Triaged: 0 | Evicted: 15 | EncQ: 0 | States: IntRet:2 PendT:1 Refine:1 (x1)[Paged Pipeline] Active: 5 | Pending: 16 | Triaged: 0 | Evicted: 15 | EncQ: 0 | States: IntRet:2 PendT:2 Refine:1 (x2)[Paged Pipeline] Active: 4 | Pending: 16 | Triaged: 0 | Evicted: 16 | EncQ: 0 | States: IntRet:2 Triage:1 PendT:1 (x3)
+Page page_9c8bff4 INTERESTING (novelty=2.27) (x1)                                                                     
+[Paged Pipeline] Active: 4 | Pending: 16 | Triaged: 0 | Evicted: 16 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:1 (x1)[Paged Pipeline] Active: 4 | Pending: 16 | Triaged: 0 | Evicted: 16 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:1 (x2)[Paged Pipeline] Active: 4 | Pending: 16 | Triaged: 0 | Evicted: 16 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:1 (x3)[Paged Pipeline] Active: 4 | Pending: 17 | Triaged: 0 | Evicted: 17 | EncQ: 0 | States: IntRet:2 Triage:1 PendT:1 (x4)
+Page page_543e3ee INTERESTING (novelty=2.20) (x1)                                                                     
+[Paged Pipeline] Active: 4 | Pending: 17 | Triaged: 0 | Evicted: 17 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:1 (x1)[Paged Pipeline] Active: 4 | Pending: 17 | Triaged: 0 | Evicted: 17 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:1 (x2)[Paged Pipeline] Active: 3 | Pending: 17 | Triaged: 0 | Evicted: 18 | EncQ: 0 | States: IntRet:2 Triage:1 (x3)        
+Page page_fe1a194 INTERESTING (novelty=17.00) (x1)                                                            
+[Paged Pipeline] Active: 4 | Pending: 18 | Triaged: 0 | Evicted: 18 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:1 (x1)[Paged Pipeline] Active: 4 | Pending: 18 | Triaged: 0 | Evicted: 18 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:1 (x2)[Paged Pipeline] Active: 3 | Pending: 18 | Triaged: 0 | Evicted: 19 | EncQ: 0 | States: IntRet:2 Triage:1 (x3)        
+Page page_4fa9556 INTERESTING (novelty=8.56) (x1)                                                             
+[Paged Pipeline] Active: 3 | Pending: 18 | Triaged: 0 | Evicted: 19 | EncQ: 0 | States: Refine:1 IntRet:2 (x1)[Paged Pipeline] Active: 4 | Pending: 19 | Triaged: 0 | Evicted: 19 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:1 (x2)[Paged Pipeline] Active: 4 | Pending: 19 | Triaged: 0 | Evicted: 19 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:1 (x3)[Paged Pipeline] Active: 3 | Pending: 19 | Triaged: 0 | Evicted: 20 | EncQ: 0 | States: IntRet:2 Triage:1 (x4)        
+Page page_2ad4b1c INTERESTING (novelty=5.50) (x1)                                                             
+[Paged Pipeline] Active: 3 | Pending: 19 | Triaged: 0 | Evicted: 20 | EncQ: 0 | States: Refine:1 IntRet:2 (x1)[Paged Pipeline] Active: 4 | Pending: 20 | Triaged: 0 | Evicted: 20 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:1 (x2)[Paged Pipeline] Active: 4 | Pending: 20 | Triaged: 0 | Evicted: 20 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:1 (x3)[Paged Pipeline] Active: 4 | Pending: 20 | Triaged: 0 | Evicted: 20 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:1 (x4)[Paged Pipeline] Active: 4 | Pending: 20 | Triaged: 0 | Evicted: 20 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:1 (x5)[Paged Pipeline] Active: 5 | Pending: 21 | Triaged: 0 | Evicted: 20 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:2 (x6)[Paged Pipeline] Active: 5 | Pending: 21 | Triaged: 0 | Evicted: 20 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:2 (x7)[Paged Pipeline] Active: 5 | Pending: 21 | Triaged: 0 | Evicted: 20 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:2 (x8)[Paged Pipeline] Active: 5 | Pending: 22 | Triaged: 0 | Evicted: 21 | EncQ: 1 | States: BorEvict:1 IntRet:2 PendT:2 (x9)[Paged Pipeline] Active: 5 | Pending: 22 | Triaged: 0 | Evicted: 21 | EncQ: 0 | States: IntRet:2 Triage:1 PendT:2 (x10) 
+Page page_0e70559 INTERESTING (novelty=0.68) (x1)                                                                      
+[Paged Pipeline] Active: 5 | Pending: 22 | Triaged: 0 | Evicted: 21 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x1)[Paged Pipeline] Active: 5 | Pending: 22 | Triaged: 0 | Evicted: 21 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x2)[Paged Pipeline] Active: 5 | Pending: 22 | Triaged: 0 | Evicted: 21 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:2 (x3)[Paged Pipeline] Active: 6 | Pending: 23 | Triaged: 0 | Evicted: 21 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x4)[Paged Pipeline] Active: 6 | Pending: 23 | Triaged: 0 | Evicted: 21 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x5)[Paged Pipeline] Active: 6 | Pending: 23 | Triaged: 0 | Evicted: 21 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x6)[Paged Pipeline] Active: 6 | Pending: 23 | Triaged: 0 | Evicted: 21 | EncQ: 0 | States: IntRet:2 Refine:1 PendT:3 (x7)[Paged Pipeline] Active: 7 | Pending: 25 | Triaged: 0 | Evicted: 22 | EncQ: 1 | States: IntRet:2 BorEvict:1 PendT:4 (x8)[Paged Pipeline] Active: 6 | Pending: 24 | Triaged: 0 | Evicted: 22 | EncQ: 0 | States: IntRet:2 PendT:3 Triage:1 (x9)  
+Page page_6883e39 boring, evicting (x1)                                                                               Page page_d852f4a INTERESTING (novelty=0.30) (x2)
+[Paged Pipeline] Active: 5 | Pending: 24 | Triaged: 0 | Evicted: 23 | EncQ: 0 | States: IntRet:2 PendT:2 Refine:1 (x1)[Paged Pipeline] Active: 6 | Pending: 25 | Triaged: 0 | Evicted: 23 | EncQ: 0 | States: IntRet:2 PendT:3 Refine:1 (x2)[Paged Pipeline] Active: 6 | Pending: 25 | Triaged: 0 | Evicted: 23 | EncQ: 0 | States: IntRet:2 PendT:3 Refine:1 (x3)[Paged Pipeline] Active: 6 | Pending: 25 | Triaged: 0 | Evicted: 23 | EncQ: 0 | States: IntRet:2 PendT:3 Refine:1 (x4)[Paged Pipeline] Active: 6 | Pending: 25 | Triaged: 0 | Evicted: 23 | EncQ: 0 | States: IntRet:2 PendT:3 Refine:1 (x5)[Paged Pipeline] Active: 7 | Pending: 26 | Triaged: 0 | Evicted: 23 | EncQ: 0 | States: IntRet:2 PendT:4 Refine:1 (x6)[Paged Pipeline] Active: 7 | Pending: 26 | Triaged: 0 | Evicted: 23 | EncQ: 0 | States: IntRet:2 PendT:4 Refine:1 (x7)[Paged Pipeline] Active: 7 | Pending: 26 | Triaged: 0 | Evicted: 23 | EncQ: 0 | States: IntRet:2 PendT:4 Refine:1 (x8)[Paged Pipeline] Active: 7 | Pending: 27 | Triaged: 0 | Evicted: 24 | EncQ: 1 | States: IntRet:2 PendT:4 BorEvict:1 (x9)[Paged Pipeline] Active: 7 | Pending: 27 | Triaged: 0 | Evicted: 24 | EncQ: 0 | States: IntRet:2 PendT:4 Triage:1 (x10) 
+Page page_800e05d boring, evicting (x1)                                                                                
+[Paged Pipeline] Active: 6 | Pending: 27 | Triaged: 0 | Evicted: 25 | EncQ: 0 | States: IntRet:2 PendT:3 Triage:1 (x1)
+Page page_a9d605c boring, evicting (x1)                                                                               Page page_377f857 boring, evicting (x2)
+[Paged Pipeline] Active: 4 | Pending: 27 | Triaged: 0 | Evicted: 27 | EncQ: 0 | States: IntRet:2 PendT:1 Triage:1 (x1)
+Page page_c2ef918 boring, evicting (x1)                                                                               
+[Paged Pipeline] Active: 3 | Pending: 27 | Triaged: 0 | Evicted: 28 | EncQ: 0 | States: IntRet:2 Triage:1 (x1)
+Page page_a1aa113 INTERESTING (novelty=0.34) (x1)                                                             
+[Paged Pipeline] Active: 4 | Pending: 28 | Triaged: 0 | Evicted: 28 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:1 (x1)[Paged Pipeline] Active: 4 | Pending: 28 | Triaged: 0 | Evicted: 28 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:1 (x2)[Paged Pipeline] Active: 4 | Pending: 28 | Triaged: 0 | Evicted: 28 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:1 (x3)[Paged Pipeline] Active: 4 | Pending: 28 | Triaged: 0 | Evicted: 28 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:1 (x4)[Paged Pipeline] Active: 5 | Pending: 29 | Triaged: 0 | Evicted: 28 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:2 (x5)[Paged Pipeline] Active: 5 | Pending: 29 | Triaged: 0 | Evicted: 28 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:2 (x6)[Paged Pipeline] Active: 5 | Pending: 29 | Triaged: 0 | Evicted: 28 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:2 (x7)[Paged Pipeline] Active: 5 | Pending: 29 | Triaged: 0 | Evicted: 28 | EncQ: 0 | States: Refine:1 IntRet:2 PendT:2 (x8)[Paged Pipeline] Active: 5 | Pending: 30 | Triaged: 0 | Evicted: 29 | EncQ: 1 | States: BorEvict:1 IntRet:2 PendT:2 (x9)[Paged Pipeline] Active: 5 | Pending: 30 | Triaged: 0 | Evicted: 29 | EncQ: 0 | States: IntRet:2 Triage:1 PendT:2 (x10) 
+Page page_e7c4d5a boring, evicting (x1)                                                                                
+[Paged Pipeline] Active: 4 | Pending: 30 | Triaged: 0 | Evicted: 30 | EncQ: 0 | States: IntRet:2 Triage:1 PendT:1 (x1)
+Page page_a951a7c boring, evicting (x1)                                                                               
+[Paged Pipeline] Active: 3 | Pending: 30 | Triaged: 0 | Evicted: 31 | EncQ: 0 | States: IntRet:2 Triage:1 (x1)
+Page page_393d06e boring, evicting (x1)                                                                       
+[Paged Pipeline] Active: 2 | Pending: 30 | Triaged: 0 | Evicted: 32 | EncQ: 0 | States: Refine:1 IntRet:1 (x1)[Paged Pipeline] Active: 3 | Pending: 31 | Triaged: 0 | Evicted: 32 | EncQ: 0 | States: Refine:1 IntRet:1 PendT:1 (x2)[Paged Pipeline] Active: 2 | Pending: 31 | Triaged: 0 | Evicted: 33 | EncQ: 0 | States: IntRet:1 Triage:1 (x3)        
+Page page_25e12a5 boring, evicting (x1)                                                                       
+[Paged Pipeline] Active: 1 | Pending: 31 | Triaged: 0 | Evicted: 34 | EncQ: 0 | States: Refine:1 (x1)[Paged Pipeline] Active: 1 | Pending: 31 | Triaged: 0 | Evicted: 34 | EncQ: 0 | States: Refine:1 (x2)[Paged Pipeline] Active: 2 | Pending: 32 | Triaged: 0 | Evicted: 34 | EncQ: 0 | States: Refine:1 PendT:1 (x3)[Paged Pipeline] Active: 2 | Pending: 32 | Triaged: 0 | Evicted: 34 | EncQ: 0 | States: Refine:1 PendT:1 (x4)[Paged Pipeline] Active: 2 | Pending: 32 | Triaged: 0 | Evicted: 34 | EncQ: 0 | States: Refine:1 PendT:1 (x5)[Paged Pipeline] Active: 2 | Pending: 32 | Triaged: 0 | Evicted: 34 | EncQ: 0 | States: Refine:1 PendT:1 (x6)[Paged Pipeline] Active: 3 | Pending: 33 | Triaged: 0 | Evicted: 34 | EncQ: 0 | States: Refine:1 PendT:2 (x7)[Paged Pipeline] Active: 3 | Pending: 33 | Triaged: 0 | Evicted: 34 | EncQ: 0 | States: Refine:1 PendT:2 (x8)[Paged Pipeline] Active: 2 | Pending: 33 | Triaged: 0 | Evicted: 35 | EncQ: 0 | States: Triage:1 PendT:1 (x9)
+Page page_6508e3d boring, evicting (x1)                                                                      
+[Paged Pipeline] Active: 1 | Pending: 33 | Triaged: 0 | Evicted: 36 | EncQ: 0 | States: Triage:1 (x1)
+Page page_77827c4 boring, evicting (x1)                                                              
+[Paged Pipeline] Active: 1 | Pending: 34 | Triaged: 0 | Evicted: 37 | EncQ: 0 | States: Triage:1 (x1)
+Page page_734e38c boring, evicting (x1)                                                              
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 38 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 38 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 38 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 38 | EncQ: 0 | States: Triage:1 (x4)
+Page page_00287d9 boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States: Triage:1 (x4)
+Page page_297719c INTERESTING (novelty=0.42) (x1)                                                   
+[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States: Refine:1 (x1)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States: Refine:1 (x2)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States: Refine:1 (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States: Refine:1 (x4)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States: Refine:1 PendT:1 (x5)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States: Refine:1 PendT:1 (x6)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States: Refine:1 PendT:1 (x7)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States: Refine:1 PendT:1 (x8)[Paged Pipeline] Active: 3 | Pending: 2 | Triaged: 0 | Evicted: 39 | EncQ: 0 | States: Refine:1 PendT:2 (x9)[Paged Pipeline] Active: 3 | Pending: 3 | Triaged: 0 | Evicted: 40 | EncQ: 1 | States: BorEvict:1 PendT:2 (x10)[Paged Pipeline] Active: 2 | Pending: 2 | Triaged: 0 | Evicted: 40 | EncQ: 0 | States: Triage:1 PendT:1 (x11)  
+Page page_1a269ca boring, evicting (x1)                                                                      
+[Paged Pipeline] Active: 2 | Pending: 3 | Triaged: 0 | Evicted: 41 | EncQ: 0 | States: Triage:1 PendT:1 (x1)
+Page page_b0de816 boring, evicting (x1)                                                                     
+[Paged Pipeline] Active: 1 | Pending: 3 | Triaged: 0 | Evicted: 42 | EncQ: 0 | States: Triage:1 (x1)
+Page page_159ed53 boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 43 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 43 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 43 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 43 | EncQ: 0 | States: Triage:1 (x4)
+Page page_e57aced boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 44 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 44 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 44 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 44 | EncQ: 0 | States: Triage:1 (x4)
+Page page_6ca6964 INTERESTING (novelty=0.50) (x1)                                                   
+[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 44 | EncQ: 0 | States: Refine:1 (x1)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 44 | EncQ: 0 | States: Refine:1 (x2)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 44 | EncQ: 0 | States: Refine:1 (x3)[Paged Pipeline] Active: 1 | Pending: 1 | Triaged: 0 | Evicted: 45 | EncQ: 0 | States: Triage:1 (x4)
+Page page_4b46a9d boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 46 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 46 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 46 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 46 | EncQ: 0 | States: Triage:1 (x4)
+Page page_5dbfd6b boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States: Triage:1 (x4)
+Page page_86f66ea INTERESTING (novelty=0.43) (x1)                                                   
+[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States: Refine:1 (x1)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States: Refine:1 (x2)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States: Refine:1 (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States: Refine:1 (x4)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States: Refine:1 PendT:1 (x5)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States: Refine:1 PendT:1 (x6)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States: Refine:1 PendT:1 (x7)[Paged Pipeline] Active: 2 | Pending: 1 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States: Refine:1 PendT:1 (x8)[Paged Pipeline] Active: 3 | Pending: 2 | Triaged: 0 | Evicted: 47 | EncQ: 0 | States: Refine:1 PendT:2 (x9)[Paged Pipeline] Active: 3 | Pending: 3 | Triaged: 0 | Evicted: 48 | EncQ: 1 | States: BorEvict:1 PendT:2 (x10)[Paged Pipeline] Active: 2 | Pending: 2 | Triaged: 0 | Evicted: 48 | EncQ: 0 | States: Triage:1 PendT:1 (x11)  
+Page page_08e6ec8 boring, evicting (x1)                                                                      
+[Paged Pipeline] Active: 1 | Pending: 2 | Triaged: 0 | Evicted: 49 | EncQ: 0 | States: Triage:1 (x1)
+Page page_c222a76 boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 1 | Pending: 3 | Triaged: 0 | Evicted: 50 | EncQ: 0 | States: Triage:1 (x1)
+Page page_f132d7c boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 51 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 51 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 51 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 51 | EncQ: 0 | States: Triage:1 (x4)
+Page page_4a27eb2 boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 52 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 52 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 52 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 52 | EncQ: 0 | States: Triage:1 (x4)
+Page page_d253482 boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 53 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 53 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 53 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 53 | EncQ: 0 | States: Triage:1 (x4)
+Page page_7e08b97 boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 54 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 54 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 54 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 54 | EncQ: 0 | States: Triage:1 (x4)
+Page page_c1e3b41 boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 55 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 55 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 55 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 55 | EncQ: 0 | States: Triage:1 (x4)
+Page page_98708eb boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 56 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 56 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 56 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 56 | EncQ: 0 | States: Triage:1 (x4)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 56 | EncQ: 0 | States: Triage:1 (x5)
+Page page_57264c1 boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 57 | EncQ: 0 | States:  (x1)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 57 | EncQ: 0 | States:  (x2)[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 57 | EncQ: 0 | States:  (x3)[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 57 | EncQ: 0 | States: Triage:1 (x4)
+Page page_8be8aca boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 58 | EncQ: 0 | States:  (x1)WARNING: Memory at 90.2%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 58 | EncQ: 0 | States:  (x2)WARNING: Memory at 90.4%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 58 | EncQ: 0 | States:  (x3)WARNING: Memory at 90.7%. Shedding boring pages.
+[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 58 | EncQ: 0 | States: Triage:1 (x4)
+Page page_9ae30a7 boring, evicting (x1)                                                             WARNING: Memory at 90.8%. Shedding boring pages.
+
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 59 | EncQ: 0 | States:  (x1)WARNING: Memory at 91.0%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 59 | EncQ: 0 | States:  (x2)WARNING: Memory at 91.2%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 59 | EncQ: 0 | States:  (x3)WARNING: Memory at 91.8%. Shedding boring pages.
+[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 59 | EncQ: 0 | States: Triage:1 (x4)
+Page page_736bde2 boring, evicting (x1)                                                             WARNING: Memory at 91.5%. Shedding boring pages.
+
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 60 | EncQ: 0 | States:  (x1)WARNING: Memory at 91.6%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 60 | EncQ: 0 | States:  (x2)WARNING: Memory at 91.7%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 60 | EncQ: 0 | States:  (x3)WARNING: Memory at 92.2%. Shedding boring pages.
+[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 60 | EncQ: 0 | States: Triage:1 (x4)WARNING: Memory at 92.2%. Shedding boring pages.
+
+Page page_2ed4d4f boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 61 | EncQ: 0 | States:  (x1)WARNING: Memory at 92.3%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 61 | EncQ: 0 | States:  (x2)WARNING: Memory at 92.5%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 61 | EncQ: 0 | States:  (x3)WARNING: Memory at 93.0%. Shedding boring pages.
+[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 61 | EncQ: 0 | States: Triage:1 (x4)WARNING: Memory at 93.0%. Shedding boring pages.
+
+Page page_2313143 boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 62 | EncQ: 0 | States:  (x1)WARNING: Memory at 93.4%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 62 | EncQ: 0 | States:  (x2)WARNING: Memory at 93.9%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 62 | EncQ: 0 | States:  (x3)WARNING: Memory at 94.1%. Shedding boring pages.
+[Paged Pipeline] Active: 1 | Pending: 0 | Triaged: 0 | Evicted: 62 | EncQ: 0 | States: Triage:1 (x4)WARNING: Memory at 94.8%. Shedding boring pages.
+
+Page page_9d439fa boring, evicting (x1)                                                             
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 63 | EncQ: 0 | States:  (x1)WARNING: Memory at 95.0%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 63 | EncQ: 0 | States:  (x2)WARNING: Memory at 95.0%. Shedding boring pages.
+[Paged Pipeline] Active: 0 | Pending: 0 | Triaged: 0 | Evicted: 63 | EncQ: 0 | States:  (x3)CRITICAL: Memory at 95.1%. Forcing shutdown.

@@ -1105,9 +1105,16 @@ class PagedOrchestrator:
         if triaging_count >= 1 or refining_count >= 1:
             return
 
+        # Derivative-based refinement priority:
+        # - If intret is accumulating (positive rate) AND interesting_waiting >= 2, force refinement
+        # - This ensures we drain the interesting buffer before it becomes a bomb
+        flow_monitor = self.scheduler.flow_monitor
+        intret_rate = flow_monitor.get_rate('intret')
+        intret_accumulating = intret_rate > 10 * 1024**2  # > 10MB/s accumulation
+
         # If interesting pages are piling up, force refinement by skipping triage
         # This prevents refinement starvation from constant new page arrivals
-        force_refinement = interesting_waiting >= 3
+        force_refinement = interesting_waiting >= 3 or (interesting_waiting >= 2 and intret_accumulating)
 
         # THEN: Get next work (possibly forcing refinement)
         work = self.scheduler.get_next_work(prefer_refinement=force_refinement)
@@ -1278,8 +1285,19 @@ class PagedOrchestrator:
                     else:
                         merged.append(interval)
 
-                # Dispatch encoding jobs
+                # Dispatch encoding jobs (with queue depth limit to prevent OOM)
+                MAX_ENCODING_QUEUE_DEPTH = 10
+                try:
+                    current_queue_depth = self.encoding_task_queue.qsize()
+                except:
+                    current_queue_depth = 0
+
                 for start_time, end_time in merged:
+                    # Drop clips if queue is too deep
+                    if current_queue_depth >= MAX_ENCODING_QUEUE_DEPTH:
+                        print(f"WARNING: Encoding queue full ({current_queue_depth}), dropping clip")
+                        continue
+
                     mask = (timestamps_arr >= start_time) & (timestamps_arr <= end_time)
                     indices = np.where(mask)[0]
                     if len(indices) > 0:
@@ -1290,6 +1308,7 @@ class PagedOrchestrator:
                             'timestamps': timestamps_to_encode,
                             'quality': 'HIGH',
                         })
+                        current_queue_depth += 1
 
             shm.close()
 
@@ -1433,15 +1452,38 @@ class PagedOrchestrator:
         }
         state_str = " ".join(f"{state_abbrev.get(k, k)}:{v}" for k, v in state_dist.items() if v > 0)
 
+        # Monitor encoding queue depth
+        try:
+            enc_queue_size = self.encoding_task_queue.qsize()
+        except:
+            enc_queue_size = -1
+
+        # Get flow derivatives
+        flow_stats = stats.get('flow', {})
+        flow_str = ""
+        for stage in ['pending', 'intret']:
+            if stage in flow_stats:
+                rate = flow_stats[stage]['rate_mb_s']
+                if abs(rate) >= 0.1:
+                    tto = flow_stats[stage]['tto_sec']
+                    if rate > 0 and tto > 0:
+                        flow_str += f" {stage}:+{rate:.1f}MB/s~{int(tto)}s"
+                    elif rate > 0:
+                        flow_str += f" {stage}:+{rate:.1f}MB/s"
+                    else:
+                        flow_str += f" {stage}:{rate:.1f}MB/s"
+
         status_line = (
             f"[Paged Pipeline] "
             f"Active: {stats['active_pages']} | "
             f"Pending: {stats['pending_work']} | "
             f"Triaged: {stats['pages_triaged']} | "
             f"Evicted: {stats['pages_evicted_boring']} | "
-            f"Interesting: {stats['pages_retained_interesting']} | "
+            f"EncQ: {enc_queue_size} | "
             f"States: {state_str}"
         )
+        if flow_str:
+            status_line += f" |{flow_str}"
         self.logger.log("status", status_line)
         self.last_log_time = now
 
@@ -1462,6 +1504,22 @@ class PagedOrchestrator:
                     for page_id, page in list(self.scheduler.pages.items()):
                         if page.state == PageState.PENDING_TRIAGE:
                             self.scheduler.schedule_eviction(page_id)
+
+            # Derivative-based eviction: check if intret is accumulating unsustainably
+            # This catches the "pending buffer bomb" before it becomes a memory crisis
+            flow_monitor = self.scheduler.flow_monitor
+            if flow_monitor.is_unsustainable('intret', threshold_bytes_per_sec=50 * 1024**2, min_duration_sec=10.0):
+                stale_count = len(self.scheduler.get_stale_intret_pages(max_age_sec=30.0))
+                if stale_count > 0:
+                    evicted = self.scheduler.force_evict_stale(max_to_evict=2)
+                    if evicted:
+                        print(f"[Guardian] Derivative-based eviction: shed {len(evicted)} stale intret pages (accumulating too fast)")
+
+            # Also check pending stage for unsustainable accumulation
+            if flow_monitor.is_unsustainable('pending', threshold_bytes_per_sec=100 * 1024**2, min_duration_sec=8.0):
+                # Force more aggressive triage by temporarily skipping refinement
+                # This is handled in _dispatch_scheduled_work via force_refinement logic
+                print(f"[Guardian] Pending stage accumulating unsustainably - check triage throughput")
 
             time.sleep(2)
 
@@ -1649,7 +1707,39 @@ Setup OBS first:
         log_file = open(args.log, 'w', encoding='utf-8')
         sys.stdout = TeeWriter(sys.__stdout__, log_file)
         sys.stderr = TeeWriter(sys.__stderr__, log_file)
-        print(f"Logging to: {args.log}")
+
+        # Ensure uncaught exceptions are logged (including from threads)
+        import traceback
+        import threading
+
+        _original_excepthook = sys.excepthook
+        def logging_excepthook(exc_type, exc_value, exc_tb):
+            """Log uncaught exceptions to the log file."""
+            # Format the exception
+            tb_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
+            error_msg = ''.join(tb_lines)
+            # Write to log file directly (in case stderr is broken)
+            log_file.write(f"\n{'='*60}\nUNCAUGHT EXCEPTION:\n{error_msg}{'='*60}\n")
+            log_file.flush()
+            # Also call original hook (writes to stderr which goes to TeeWriter)
+            _original_excepthook(exc_type, exc_value, exc_tb)
+
+        sys.excepthook = logging_excepthook
+
+        # Also capture thread exceptions (Python 3.8+)
+        _original_thread_excepthook = threading.excepthook
+        def logging_thread_excepthook(args):
+            """Log uncaught exceptions from threads."""
+            tb_lines = traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
+            error_msg = ''.join(tb_lines)
+            thread_name = args.thread.name if args.thread else "Unknown"
+            log_file.write(f"\n{'='*60}\nUNCAUGHT THREAD EXCEPTION (thread: {thread_name}):\n{error_msg}{'='*60}\n")
+            log_file.flush()
+            _original_thread_excepthook(args)
+
+        threading.excepthook = logging_thread_excepthook
+
+        print(f"Logging to: {args.log} (with exception capture)")
 
     # Determine capture mode
     use_obs = False

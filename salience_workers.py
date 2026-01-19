@@ -33,6 +33,124 @@ def log_attention_backend_status(worker_pid):
     else:
         print(f"[{worker_pid}] ⚠️ PyTorch attention backend fell back to MATH (Eager/Slowest)")
 
+
+# =============================================================================
+#  GPU-ACCELERATED FRAME PREPROCESSING
+# =============================================================================
+
+class GPUFramePreprocessor:
+    """
+    GPU-accelerated frame preprocessing. Avoids PIL entirely.
+
+    Flow: numpy (HWC uint8) -> pinned tensor -> GPU -> resize -> normalize -> model
+
+    This is MUCH faster than the CPU path:
+      CPU: numpy -> PIL.Image -> PIL.resize(LANCZOS) -> processor -> tensor -> .to(GPU)
+      GPU: numpy -> pinned tensor -> GPU -> F.interpolate -> normalize (all on GPU)
+    """
+
+    # ImageNet normalization (used by SigLIP and most vision models)
+    IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
+    IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
+
+    def __init__(self, device: torch.device, target_size: tuple[int, int] = (384, 384),
+                 dtype: torch.dtype = torch.bfloat16):
+        """
+        Args:
+            device: Target GPU device
+            target_size: (H, W) output size for model input
+            dtype: Model dtype (bfloat16 for most modern models)
+        """
+        self.device = device
+        self.target_size = target_size
+        self.dtype = dtype
+
+        # Move normalization constants to GPU
+        self.mean = self.IMAGENET_MEAN.view(1, 3, 1, 1).to(device, dtype=torch.float32)
+        self.std = self.IMAGENET_STD.view(1, 3, 1, 1).to(device, dtype=torch.float32)
+
+        # Pinned memory buffer for async CPU->GPU transfer (reused across batches)
+        self._pinned_buffer = None
+        self._pinned_buffer_size = 0
+
+    def _ensure_pinned_buffer(self, shape: tuple) -> torch.Tensor:
+        """Get or create a pinned memory buffer of sufficient size."""
+        needed_size = int(np.prod(shape))
+        if self._pinned_buffer is None or self._pinned_buffer_size < needed_size:
+            # Allocate new pinned buffer (this is expensive, so we reuse)
+            self._pinned_buffer = torch.empty(
+                needed_size, dtype=torch.uint8, pin_memory=True
+            )
+            self._pinned_buffer_size = needed_size
+        return self._pinned_buffer[:needed_size].view(shape)
+
+    @torch.no_grad()
+    def preprocess_batch(self, frames: np.ndarray) -> torch.Tensor:
+        """
+        Preprocess a batch of frames entirely on GPU.
+
+        Args:
+            frames: numpy array of shape (N, H, W, C) uint8 RGB
+
+        Returns:
+            Tensor of shape (N, C, target_H, target_W) normalized and ready for model
+        """
+        if frames.ndim == 3:
+            frames = frames[np.newaxis, ...]  # Add batch dim
+
+        N, H, W, C = frames.shape
+
+        # Step 1: Copy to pinned memory (enables async transfer)
+        pinned = self._ensure_pinned_buffer((N, H, W, C))
+        pinned.copy_(torch.from_numpy(frames))
+
+        # Step 2: Async transfer to GPU + convert to float [0, 1]
+        gpu_tensor = pinned.to(self.device, non_blocking=True).float() / 255.0
+
+        # Step 3: Reorder HWC -> CHW (vision model format)
+        gpu_tensor = gpu_tensor.permute(0, 3, 1, 2)  # (N, C, H, W)
+
+        # Step 4: Resize using GPU-accelerated bilinear interpolation
+        # (bicubic is closer to LANCZOS but bilinear is faster and good enough)
+        if (H, W) != self.target_size:
+            gpu_tensor = F.interpolate(
+                gpu_tensor,
+                size=self.target_size,
+                mode='bilinear',
+                align_corners=False,
+                antialias=True  # Important for downscaling quality
+            )
+
+        # Step 5: Normalize with ImageNet stats
+        gpu_tensor = (gpu_tensor - self.mean) / self.std
+
+        # Step 6: Convert to model dtype
+        return gpu_tensor.to(self.dtype)
+
+    def preprocess_single(self, frame: np.ndarray) -> torch.Tensor:
+        """Convenience method for single frame."""
+        return self.preprocess_batch(frame[np.newaxis, ...])[0]
+
+
+# For models that need different normalization (e.g., CLIP uses different values)
+class SigLIPPreprocessor(GPUFramePreprocessor):
+    """SigLIP-specific preprocessor with correct normalization."""
+    # SigLIP uses these values (from the processor config)
+    SIGLIP_MEAN = torch.tensor([0.5, 0.5, 0.5])
+    SIGLIP_STD = torch.tensor([0.5, 0.5, 0.5])
+
+    def __init__(self, device: torch.device, target_size: tuple[int, int], dtype: torch.dtype = torch.bfloat16):
+        """
+        Args:
+            device: GPU device
+            target_size: (H, W) from processor config - MUST match model's expected size
+            dtype: Model dtype
+        """
+        super().__init__(device, target_size=target_size, dtype=dtype)
+        # Override with SigLIP normalization
+        self.mean = self.SIGLIP_MEAN.view(1, 3, 1, 1).to(device, dtype=torch.float32)
+        self.std = self.SIGLIP_STD.view(1, 3, 1, 1).to(device, dtype=torch.float32)
+
 class LazyFrameAccessor:
     """
         Wraps the SHM buffer and preprocesses frames only when accessed.
@@ -72,7 +190,17 @@ class LazyFrameAccessor:
         return processed_frame
 
     def get_batch(self, indices: list[int]) -> list[Image.Image]:
+        """Get batch of preprocessed PIL images (legacy CPU path)."""
         return [self[i] for i in indices]
+
+    def get_raw_batch(self, indices: list[int]) -> np.ndarray:
+        """
+        Get batch of raw numpy frames (for GPU preprocessing path).
+
+        Returns:
+            numpy array of shape (N, H, W, C) uint8
+        """
+        return self.buffer[indices]  # Direct numpy slicing - very fast
 
     def close(self):
         self.shm.close()
@@ -131,7 +259,7 @@ class SigLIPKernel(SalienceKernel):
     def __init__(self, config: dict):
         super().__init__(config)
         self.kernel_name = "SIGLIP"
-        
+
         model_path = "./models/siglip"
         if not os.path.isdir(model_path): raise FileNotFoundError(f"SigLIP model not found at '{model_path}'.")
         model_kwargs = {"dtype": torch.bfloat16, "attn_implementation": "sdpa"} if self.device.type == 'cuda' else {}
@@ -139,8 +267,50 @@ class SigLIPKernel(SalienceKernel):
         self.processor = AutoProcessor.from_pretrained(model_path)
         self.vision_encoder = self.model.vision_model.eval()
 
+        # GPU-accelerated preprocessing (skips PIL entirely)
+        if self.device.type == 'cuda':
+            # Get correct image size from processor config
+            try:
+                img_size = self.processor.image_processor.size
+                if isinstance(img_size, dict):
+                    # Handle {"height": H, "width": W} format
+                    target_size = (img_size.get('height', 384), img_size.get('width', 384))
+                elif isinstance(img_size, int):
+                    target_size = (img_size, img_size)
+                else:
+                    target_size = (384, 384)  # fallback
+                print(f"[SigLIPKernel] GPU preprocessor target size: {target_size}")
+            except Exception as e:
+                print(f"[SigLIPKernel] Could not detect image size, using 384x384: {e}")
+                target_size = (384, 384)
+
+            self.gpu_preprocessor = SigLIPPreprocessor(self.device, target_size=target_size, dtype=self.model.dtype)
+        else:
+            self.gpu_preprocessor = None
+
+    @torch.no_grad()
+    def get_latents_for_frames(self, frames: np.ndarray) -> torch.Tensor:
+        """
+        GPU-accelerated path: numpy frames -> GPU preprocess -> model.
+
+        Args:
+            frames: numpy array of shape (N, H, W, C) uint8 RGB
+
+        Returns:
+            Latent tensor of shape (N, latent_dim)
+        """
+        if self.gpu_preprocessor is not None:
+            # Fast GPU path: no PIL, no CPU preprocessing
+            pixel_values = self.gpu_preprocessor.preprocess_batch(frames)
+            return self.vision_encoder(pixel_values).pooler_output
+        else:
+            # Fallback to CPU path via PIL
+            images = [Image.fromarray(f) for f in frames]
+            return self.get_latents_for_images(images)
+
     @torch.no_grad()
     def get_latents_for_images(self, images: list[Image.Image]) -> torch.Tensor:
+        """Legacy CPU path using HuggingFace processor (slower)."""
         inputs = self.processor(images=images, return_tensors="pt", padding=True)
         pixel_values = inputs["pixel_values"].to(self.device, dtype=self.model.dtype)
         return self.vision_encoder(pixel_values).pooler_output
@@ -306,12 +476,16 @@ class SearchAgent:
         self.frames_processed += len(sentinel_indices)
 
         with torch.cuda.stream(self.stream):
-            images = self.frame_accessor.get_batch(sentinel_indices)
-            
             # --- STAGE 1: GPU WORK ---
-            # Get latents and immediately calculate scores and novelty.
-            # This keeps everything on the GPU until all calculations are done.
-            latents_gpu = self.kernel.get_latents_for_images(images)
+            # Use GPU preprocessing path if available (much faster)
+            if hasattr(self.kernel, 'get_latents_for_frames') and hasattr(self.kernel, 'gpu_preprocessor') and self.kernel.gpu_preprocessor is not None:
+                # Fast path: raw numpy -> GPU preprocess -> model (no PIL!)
+                raw_frames = self.frame_accessor.get_raw_batch(sentinel_indices)
+                latents_gpu = self.kernel.get_latents_for_frames(raw_frames)
+            else:
+                # Legacy path: PIL preprocessing on CPU
+                images = self.frame_accessor.get_batch(sentinel_indices)
+                latents_gpu = self.kernel.get_latents_for_images(images)
             scores = self.kernel.tracker.get_novelty_scores(latents_gpu)
             is_novel_mask, z_scores = self.kernel.tracker.is_novel(scores)
             
@@ -529,9 +703,13 @@ class TwoPhaseTriageCoordinator:
         # Sample few sentinel indices (e.g., 6 evenly spaced)
         sentinel_indices = np.linspace(0, num_frames - 1, self.coarse_sentinels, dtype=int).tolist()
 
-        # Get frames and compute latents
-        images = frame_accessor.get_batch(sentinel_indices)
-        latents = kernel.get_latents_for_images(images)
+        # Get frames and compute latents (use GPU path if available)
+        if hasattr(kernel, 'get_latents_for_frames') and hasattr(kernel, 'gpu_preprocessor') and kernel.gpu_preprocessor is not None:
+            raw_frames = frame_accessor.get_raw_batch(sentinel_indices)
+            latents = kernel.get_latents_for_frames(raw_frames)
+        else:
+            images = frame_accessor.get_batch(sentinel_indices)
+            latents = kernel.get_latents_for_images(images)
 
         # Get novelty scores
         scores = kernel.tracker.get_novelty_scores(latents)
@@ -608,8 +786,13 @@ class TwoPhaseTriageCoordinator:
 
             frames_processed += len(indices)
 
-            images = frame_accessor.get_batch(indices)
-            latents = kernel.get_latents_for_images(images)
+            # Use GPU preprocessing path if available
+            if hasattr(kernel, 'get_latents_for_frames') and hasattr(kernel, 'gpu_preprocessor') and kernel.gpu_preprocessor is not None:
+                raw_frames = frame_accessor.get_raw_batch(indices)
+                latents = kernel.get_latents_for_frames(raw_frames)
+            else:
+                images = frame_accessor.get_batch(indices)
+                latents = kernel.get_latents_for_images(images)
             scores = kernel.tracker.get_novelty_scores(latents)
             is_novel_mask, z_scores = kernel.tracker.is_novel(scores)
 

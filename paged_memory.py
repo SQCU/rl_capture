@@ -17,11 +17,205 @@ import numpy as np
 import time
 import uuid
 import heapq
+from collections import deque
 from enum import Enum, auto
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Any
 from multiprocessing import shared_memory
 from threading import Lock
+
+
+# =============================================================================
+#  FLOW MONITOR: Derivative-based resource tracking
+# =============================================================================
+
+class FlowMonitor:
+    """
+    Track bytes/sec derivatives across processing stages.
+
+    Instead of threshold-based limits ("if queue > 10, drop"):
+    - Track rate of change (d_bytes/d_t) per stage
+    - Detect sustained positive derivatives → "accumulating unsustainably"
+    - Predict time-to-overflow based on current rate
+    - Enable early intervention before hitting hard limits
+
+    The metadata cost is trivial (few KB) vs megabytes of actual buffers.
+    """
+
+    def __init__(self, window_sec: float = 5.0):
+        """
+        Args:
+            window_sec: Time window for derivative calculation
+        """
+        self.window = window_sec
+        self.flows: Dict[str, deque] = {}  # stage -> [(timestamp, net_bytes)]
+        self.stage_current: Dict[str, int] = {}  # stage -> current bytes held
+        self.lock = Lock()
+
+    def record(self, stage: str, bytes_in: int = 0, bytes_out: int = 0) -> None:
+        """
+        Record a flow event (bytes entering or leaving a stage).
+
+        Args:
+            stage: Processing stage name (e.g., 'pending', 'intret', 'encqueue')
+            bytes_in: Bytes entering this stage
+            bytes_out: Bytes leaving this stage
+        """
+        now = time.monotonic()
+        net = bytes_in - bytes_out
+
+        with self.lock:
+            if stage not in self.flows:
+                self.flows[stage] = deque(maxlen=500)
+                self.stage_current[stage] = 0
+
+            self.flows[stage].append((now, net))
+            self.stage_current[stage] = max(0, self.stage_current.get(stage, 0) + net)
+
+    def record_pages(self, stage: str, pages_in: int = 0, pages_out: int = 0,
+                     bytes_per_page: int = 640*480*3*480) -> None:
+        """
+        Convenience: record page-level flow (auto-converts to bytes).
+
+        Default bytes_per_page assumes 640x480 RGB @ 480 frames/page (8s @ 60fps).
+        """
+        self.record(stage,
+                    bytes_in=pages_in * bytes_per_page,
+                    bytes_out=pages_out * bytes_per_page)
+
+    def get_rate(self, stage: str) -> float:
+        """
+        Get current bytes/sec accumulation rate for a stage.
+
+        Returns:
+            Positive = growing (bad), Negative = draining (good), Zero = stable
+        """
+        with self.lock:
+            if stage not in self.flows:
+                return 0.0
+
+            now = time.monotonic()
+            cutoff = now - self.window
+            events = self.flows[stage]
+
+            # Sum deltas within window
+            net = sum(delta for ts, delta in events if ts > cutoff)
+            return net / self.window
+
+    def get_current(self, stage: str) -> int:
+        """Get current bytes held at a stage."""
+        with self.lock:
+            return self.stage_current.get(stage, 0)
+
+    def time_to_overflow(self, stage: str, max_bytes: int) -> float:
+        """
+        Estimate seconds until overflow at current accumulation rate.
+
+        Args:
+            stage: Processing stage
+            max_bytes: Maximum allowed bytes for this stage
+
+        Returns:
+            Seconds until overflow. inf if draining or stable.
+        """
+        rate = self.get_rate(stage)
+        if rate <= 0:
+            return float('inf')
+
+        current = self.get_current(stage)
+        remaining = max_bytes - current
+        if remaining <= 0:
+            return 0.0
+
+        return remaining / rate
+
+    def is_unsustainable(self, stage: str, threshold_bytes_per_sec: float = 1e6,
+                         min_duration_sec: float = 3.0) -> bool:
+        """
+        Check if a stage has been accumulating unsustainably.
+
+        Args:
+            stage: Processing stage
+            threshold_bytes_per_sec: Rate above which accumulation is "unsustainable"
+            min_duration_sec: How long the rate must persist to trigger
+
+        Returns:
+            True if stage is accumulating faster than threshold for min_duration
+        """
+        with self.lock:
+            if stage not in self.flows:
+                return False
+
+            now = time.monotonic()
+            events = list(self.flows[stage])
+
+        # Check if rate has been positive for min_duration
+        if len(events) < 2:
+            return False
+
+        # Find earliest event in our window
+        cutoff = now - min_duration_sec
+        window_events = [(ts, delta) for ts, delta in events if ts > cutoff]
+        if len(window_events) < 2:
+            return False
+
+        # Check rate over this period
+        duration = now - window_events[0][0]
+        if duration < min_duration_sec * 0.8:  # Allow some slack
+            return False
+
+        total_net = sum(delta for _, delta in window_events)
+        rate = total_net / duration
+
+        return rate > threshold_bytes_per_sec
+
+    def get_stats(self) -> Dict[str, Dict[str, float]]:
+        """
+        Get stats for all monitored stages.
+
+        Returns:
+            {stage: {"rate_mb_s": float, "current_mb": float, "tto_sec": float or inf}}
+        """
+        with self.lock:
+            stages = list(self.flows.keys())
+
+        stats = {}
+        for stage in stages:
+            rate = self.get_rate(stage)
+            current = self.get_current(stage)
+            # Estimate overflow assuming ~2GB max per stage
+            tto = self.time_to_overflow(stage, max_bytes=2 * 1024**3)
+
+            stats[stage] = {
+                "rate_mb_s": rate / (1024**2),
+                "current_mb": current / (1024**2),
+                "tto_sec": tto if tto != float('inf') else -1,  # -1 = stable/draining
+            }
+
+        return stats
+
+    def format_status(self, stage: str, max_bytes: int = 2 * 1024**3) -> str:
+        """
+        Format a compact status string for a stage.
+
+        Returns something like: "+2.1MB/s ~47s" or "-0.5MB/s ok" or "stable"
+        """
+        rate = self.get_rate(stage)
+        rate_mb = rate / (1024**2)
+
+        if abs(rate_mb) < 0.1:
+            return "stable"
+
+        tto = self.time_to_overflow(stage, max_bytes)
+
+        if rate > 0:
+            if tto < float('inf'):
+                return f"+{rate_mb:.1f}MB/s ~{int(tto)}s"
+            else:
+                return f"+{rate_mb:.1f}MB/s"
+        else:
+            return f"{rate_mb:.1f}MB/s ok"
+
 
 # =============================================================================
 #  CONFIGURATION: Paged Memory Model
@@ -130,6 +324,9 @@ class GlobalScheduler:
         self.current_refinement_page: Optional[str] = None
         self.preemption_requested = False
 
+        # Flow monitor for derivative-based resource tracking
+        self.flow_monitor = FlowMonitor(window_sec=5.0)
+
         # Stats
         self.pages_triaged = 0
         self.pages_evicted_boring = 0
@@ -148,6 +345,10 @@ class GlobalScheduler:
             # Store the SHM handle to keep it alive (critical for Windows!)
             if shm_handle is not None:
                 self.shm_handles[page.page_id] = shm_handle
+
+            # Track flow: page entering pending stage
+            page_bytes = int(np.prod(page.shape)) * np.dtype(page.dtype).itemsize
+            self.flow_monitor.record('pending', bytes_in=page_bytes)
 
             # Immediately schedule coarse triage (highest priority)
             work = WorkItem(
@@ -171,6 +372,11 @@ class GlobalScheduler:
             page.state = PageState.INTERESTING_RETAINED
             page.coarse_novelty_score = novelty_score
 
+            # Track flow: page moving pending → interesting_retained
+            page_bytes = int(np.prod(page.shape)) * np.dtype(page.dtype).itemsize
+            self.flow_monitor.record('pending', bytes_out=page_bytes)
+            self.flow_monitor.record('intret', bytes_in=page_bytes)
+
             # Priority: 1.0 base + inverse novelty (more novel = lower priority number = process sooner)
             # But still lower priority than any triage (which is 0.x)
             priority = 1.0 + (1.0 - min(novelty_score, 1.0))
@@ -190,6 +396,11 @@ class GlobalScheduler:
                 return
 
             page = self.pages[page_id]
+
+            # Track flow: page leaving pending stage (boring eviction)
+            page_bytes = int(np.prod(page.shape)) * np.dtype(page.dtype).itemsize
+            self.flow_monitor.record('pending', bytes_out=page_bytes)
+
             page.state = PageState.BORING_EVICTING
 
             work = WorkItem(
@@ -286,7 +497,11 @@ class GlobalScheduler:
         with self.lock:
             self.current_refinement_page = None
             if page_id in self.pages:
-                self.pages[page_id].state = PageState.ENCODING_INTERESTING
+                page = self.pages[page_id]
+                # Track flow: page leaving intret stage after refinement
+                page_bytes = int(np.prod(page.shape)) * np.dtype(page.dtype).itemsize
+                self.flow_monitor.record('intret', bytes_out=page_bytes)
+                page.state = PageState.ENCODING_INTERESTING
 
     def evict_page(self, page_id: str) -> Optional[shared_memory.SharedMemory]:
         """Remove a page from tracking and return its SHM for cleanup."""
@@ -295,7 +510,16 @@ class GlobalScheduler:
                 return None
 
             page = self.pages.pop(page_id)
+            prev_state = page.state
             page.state = PageState.EVICTED
+
+            # Track flow based on previous state
+            page_bytes = int(np.prod(page.shape)) * np.dtype(page.dtype).itemsize
+            if prev_state == PageState.INTERESTING_RETAINED:
+                # Force-evicting an unrefined interesting page
+                self.flow_monitor.record('intret', bytes_out=page_bytes)
+            # Note: BORING_EVICTING already tracked bytes_out in schedule_eviction
+            # and ENCODING_INTERESTING already tracked in complete_refinement
 
             # Use stored handle if available (critical for Windows!)
             if page_id in self.shm_handles:
@@ -317,6 +541,9 @@ class GlobalScheduler:
                 state_name = page.state.name
                 state_counts[state_name] = state_counts.get(state_name, 0) + 1
 
+            # Get flow stats
+            flow_stats = self.flow_monitor.get_stats()
+
             return {
                 "active_pages": len(self.pages),
                 "pending_work": len(self.work_queue),
@@ -325,7 +552,50 @@ class GlobalScheduler:
                 "pages_retained_interesting": self.pages_retained_interesting,
                 "state_distribution": state_counts,
                 "current_refinement": self.current_refinement_page,
+                "flow": flow_stats,
             }
+
+    def get_stale_intret_pages(self, max_age_sec: float = 60.0) -> List[str]:
+        """
+        Get list of INTERESTING_RETAINED pages that have been waiting too long.
+
+        Used for derivative-based eviction: if intret is accumulating unsustainably,
+        these are candidates for forced eviction (oldest first).
+        """
+        now = time.time()
+        stale = []
+        with self.lock:
+            for page_id, page in self.pages.items():
+                if page.state == PageState.INTERESTING_RETAINED:
+                    age = now - page.created_at
+                    if age > max_age_sec:
+                        stale.append((age, page_id, page.coarse_novelty_score or 0))
+
+        # Sort by age descending (oldest first), then by novelty ascending (least novel first)
+        stale.sort(key=lambda x: (-x[0], x[2]))
+        return [page_id for _, page_id, _ in stale]
+
+    def force_evict_stale(self, max_to_evict: int = 2) -> List[str]:
+        """
+        Force-evict the oldest/least-interesting retained pages.
+
+        Called when intret stage is accumulating unsustainably.
+        Returns list of evicted page IDs.
+        """
+        stale = self.get_stale_intret_pages(max_age_sec=30.0)
+        evicted = []
+
+        for page_id in stale[:max_to_evict]:
+            shm = self.evict_page(page_id)
+            if shm:
+                try:
+                    shm.close()
+                    shm.unlink()
+                except:
+                    pass
+                evicted.append(page_id)
+
+        return evicted
 
 
 # =============================================================================
